@@ -1,0 +1,48 @@
+# =============================================================================
+# StreamGraph — .gitignore
+# =============================================================================
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+*.egg
+.venv/
+venv/
+env/
+
+# Environment
+.env.local
+.env.production
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Data files
+data/*.gz
+data/*.csv
+!data/paysim_dataset.csv
+!data/paysim_sample.csv
+
+# Benchmark output (generated at runtime)
+benchmarks/*.csv
+benchmarks/*.json
+benchmarks/*.log
+
+# Docker volumes (managed by Docker)
+docker-volumes/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/

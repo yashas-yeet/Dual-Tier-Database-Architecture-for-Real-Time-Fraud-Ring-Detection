@@ -1,0 +1,707 @@
+# =============================================================================
+# StreamGraph — Docker Compose Orchestration
+# =============================================================================
+# IEEE Research Project: Dual-Tier Database Architecture for Real-Time
+# Financial Fraud Ring Detection
+#
+# ARCHITECTURE OVERVIEW (for the paper's System Design section):
+# ┌─────────────┐    ┌──────────────────────────────────────────┐    ┌─────────┐
+# │   Kafka      │───▶│  Flink Cluster (JobManager + TaskMgr)   │───▶│  Neo4j  │
+# │  (Commit Log)│    │  State Backend: RocksDB                 │    │ (Graph) │
+# └─────────────┘    └──────────────────────────────────────────┘    └─────────┘
+#
+
+# WHY THIS MATTERS (Systems Theory):
+# - Kafka provides a durable, partitioned commit log with exactly-once
+#   semantics (via idempotent producers), decoupling ingestion from processing.
+# - Flink's RocksDB state backend enables incremental checkpointing of keyed
+#   state to persistent storage, surviving TaskManager failures without
+#   replaying the entire Kafka topic — critical for stateful stream processing
+#   at scale.
+# - Neo4j handles the structural (graph-topological) queries that would be
+#   prohibitively expensive in a relational or key-value store, specifically
+#   variable-length path traversals for cycle detection (fraud rings).
+#
+# The dual-tier design ensures that the expensive O(V+E) graph traversal in
+# Neo4j is ONLY triggered when Tier 1 (Flink/RocksDB) detects a temporal
+# anomaly, reducing graph query load by orders of magnitude compared to a
+# naive "query everything" approach.
+# =============================================================================
+
+# Docker Compose specification version.
+# We use the Compose Specification (no version key needed for modern Docker
+# Compose v2+), but we include it for broad compatibility.
+version: "3.9"
+
+# =============================================================================
+# NETWORK CONFIGURATION
+# =============================================================================
+# All services communicate over a dedicated bridge network. This provides:
+# 1. DNS-based service discovery (containers resolve each other by name).
+# 2. Network isolation from the host and other Docker networks.
+# 3. Deterministic hostname resolution for Flink's JobManager RPC.
+networks:
+  streamgraph-net:
+    driver: bridge
+    name: streamgraph-net
+
+# =============================================================================
+# PERSISTENT VOLUMES
+# =============================================================================
+# Named volumes provide data persistence across container restarts.
+# - Kafka data: Retains committed offsets and topic partitions.
+# - Neo4j data: Retains the property graph (nodes, relationships, indexes).
+# - Flink checkpoints: Retains RocksDB incremental checkpoint snapshots.
+volumes:
+  kafka-data:
+    name: streamgraph-kafka-data
+  neo4j-data:
+    name: streamgraph-neo4j-data
+  neo4j-logs:
+    name: streamgraph-neo4j-logs
+  flink-checkpoints:
+    name: streamgraph-flink-checkpoints
+
+# =============================================================================
+# SERVICE DEFINITIONS
+# =============================================================================
+services:
+
+  # ===========================================================================
+  # ZOOKEEPER — Distributed Coordination Service
+  # ===========================================================================
+  # Kafka (in traditional mode) requires ZooKeeper for:
+  # 1. Broker registration and leader election.
+  # 2. Topic/partition metadata management.
+  # 3. Consumer group coordination (older consumers).
+  #
+  # NOTE FOR IEEE PAPER: ZooKeeper is the consensus layer implementing ZAB
+  # (ZooKeeper Atomic Broadcast), a variant of Paxos. It guarantees linearizable
+  # writes and sequential consistency for reads — properties we inherit for
+  # Kafka's metadata management.
+  #
+  # In production, ZooKeeper would run as a 3-node or 5-node ensemble for
+  # fault tolerance (2f+1 nodes tolerate f failures). For this research
+  # prototype, a single node suffices.
+  # ===========================================================================
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.6.1
+    container_name: streamgraph-zookeeper
+    hostname: zookeeper
+    networks:
+      - streamgraph-net
+    ports:
+      # Client port: Kafka brokers connect here for coordination.
+      - "2181:2181"
+    environment:
+      # ZOOKEEPER_CLIENT_PORT: The port on which ZooKeeper listens for
+      # client connections (i.e., Kafka brokers).
+      ZOOKEEPER_CLIENT_PORT: 2181
+      # ZOOKEEPER_TICK_TIME: The basic time unit (in ms) used by ZooKeeper
+      # for heartbeats. The minimum session timeout is 2× this value.
+      # A 2-second tick is the standard default.
+      ZOOKEEPER_TICK_TIME: 2000
+      # JVM heap size — ZooKeeper is metadata-only, 512 MB is generous
+      # for a single-broker setup.
+      KAFKA_HEAP_OPTS: "-Xmx512m -Xms512m"
+    healthcheck:
+      # Verify ZooKeeper is accepting client connections by sending
+      # the "ruok" (are you OK?) four-letter command.
+      test: ["CMD", "cub", "zk-ready", "localhost:2181", "30"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    restart: unless-stopped
+
+  # ===========================================================================
+  # APACHE KAFKA — Distributed Commit Log / Message Broker
+  # ===========================================================================
+  # Kafka serves as the durable, ordered, partitioned commit log at the heart
+  # of StreamGraph's ingestion pipeline. Key design properties:
+  #
+  # 1. ORDERING GUARANTEE: Messages within a partition are strictly ordered
+  #    by offset. We partition by `nameOrig` (account ID) to ensure all
+  #    transactions from the same account are processed sequentially by the
+  #    same Flink subtask — a prerequisite for correct windowed aggregation.
+  #
+  # 2. DURABILITY: With `min.insync.replicas=1` (single-broker setup) and
+  #    `acks=all` on the producer, every acknowledged write is flushed to
+  #    the commit log before the producer receives confirmation.
+  #
+  # 3. REPLAYABILITY: Kafka retains messages for a configurable period
+  #    (default 7 days). This allows Flink to replay from an earlier offset
+  #    after a failure, re-deriving state from the commit log — the
+  #    foundation of exactly-once processing semantics.
+  #
+  # FOR THE IEEE PAPER: Kafka's log-structured storage model is inspired by
+  # the write-ahead log (WAL) pattern in traditional DBMS architectures,
+  # extended to a distributed, partitioned, replicated setting.
+  # ===========================================================================
+  kafka:
+    image: confluentinc/cp-kafka:7.6.1
+    container_name: streamgraph-kafka
+    hostname: kafka
+    networks:
+      - streamgraph-net
+    ports:
+      # 9092: Internal listener (inter-container communication via Docker DNS).
+      # 9093: External listener (host machine access for producer.py, etc.).
+      - "9092:9092"
+      - "9093:9093"
+    environment:
+      # -----------------------------------------------------------------------
+      # BROKER IDENTITY
+      # -----------------------------------------------------------------------
+      KAFKA_BROKER_ID: 1
+
+      # -----------------------------------------------------------------------
+      # ZOOKEEPER CONNECTION
+      # -----------------------------------------------------------------------
+      KAFKA_ZOOKEEPER_CONNECT: "zookeeper:2181"
+
+      # -----------------------------------------------------------------------
+      # LISTENER CONFIGURATION
+      # -----------------------------------------------------------------------
+      # We configure two listeners to handle both intra-Docker and host-to-Docker
+      # communication — a common pain point in containerized Kafka setups.
+      #
+      # INTERNAL: Used by Flink TaskManagers (inside Docker network).
+      #   Advertised as kafka:9092 (Docker DNS resolves this).
+      #
+      # EXTERNAL: Used by producer.py running on the host machine.
+      #   Advertised as localhost:9093 (host's loopback interface).
+      #
+      # SECURITY PROTOCOL MAP: Both use PLAINTEXT (no TLS/SASL) for simplicity
+      # in this research prototype.
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: "INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT"
+      KAFKA_LISTENERS: "INTERNAL://0.0.0.0:9092,EXTERNAL://0.0.0.0:9093"
+      KAFKA_ADVERTISED_LISTENERS: "INTERNAL://kafka:9092,EXTERNAL://localhost:9093"
+      KAFKA_INTER_BROKER_LISTENER_NAME: "INTERNAL"
+
+      # -----------------------------------------------------------------------
+      # TOPIC DEFAULTS
+      # -----------------------------------------------------------------------
+      # For a single-broker research cluster, replication factor must be 1.
+      # In production, this would be 3 for fault tolerance.
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_DEFAULT_REPLICATION_FACTOR: 1
+      KAFKA_MIN_INSYNC_REPLICAS: 1
+
+      # Number of partitions for auto-created topics. We use 4 to allow
+      # Flink parallelism up to 4 subtasks.
+      KAFKA_NUM_PARTITIONS: 4
+
+      # -----------------------------------------------------------------------
+      # LOG RETENTION
+      # -----------------------------------------------------------------------
+      # Retain messages for 24 hours — sufficient for our benchmarking runs
+      # while preventing unbounded disk growth.
+      KAFKA_LOG_RETENTION_HOURS: 24
+
+      # -----------------------------------------------------------------------
+      # PERFORMANCE TUNING
+      # -----------------------------------------------------------------------
+      # Allow topic auto-creation for convenience during development.
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+
+      # Message size limit: 10 MB. PaySim rows are small (~500 bytes each),
+      # but we set a generous limit to avoid surprises with batched messages.
+      KAFKA_MESSAGE_MAX_BYTES: 10485760
+
+      # JVM heap size for the broker.
+      KAFKA_HEAP_OPTS: "-Xmx1g -Xms1g"
+
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+    depends_on:
+      zookeeper:
+        condition: service_healthy
+    healthcheck:
+      # Verify the broker is up by listing topics.
+      test: [ "CMD-SHELL", "kafka-topics --bootstrap-server localhost:9092 --list || exit 1" ]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+    restart: unless-stopped
+
+  # ===========================================================================
+  # KAFKA TOPIC INITIALIZER — One-Shot Setup Container
+  # ===========================================================================
+  # This ephemeral container creates the required Kafka topics with explicit
+  # partition counts and replication factors, then exits.
+  #
+  # WHY NOT AUTO-CREATE? While Kafka can auto-create topics, explicit creation
+  # gives us control over partition count (which directly affects parallelism)
+  # and ensures topics exist before Flink starts consuming.
+  #
+  # TOPICS:
+  # - raw-transactions (4 partitions): Ingestion from producer.py.
+  # - suspicious-log (4 partitions): Tier 1 → Tier 2 routing for flagged txns.
+  # - cleared-log (4 partitions): Cleared transactions (no further processing).
+  # - fraud-alerts (2 partitions): Confirmed fraud rings from Tier 2.
+  # - benchmark-metrics (1 partition): Latency/throughput measurements.
+  # ===========================================================================
+  kafka-init:
+    image: confluentinc/cp-kafka:7.6.1
+    container_name: streamgraph-kafka-init
+    hostname: kafka-init
+    networks:
+      - streamgraph-net
+    depends_on:
+      kafka:
+        condition: service_healthy
+    entrypoint: [ "/bin/bash", "-c" ]
+    command: |
+      "
+      echo '=========================================='
+      echo 'StreamGraph: Creating Kafka Topics...'
+      echo '=========================================='
+
+      # Wait for Kafka broker to be fully ready (belt-and-suspenders).
+      cub kafka-ready -b kafka:9092 1 60
+
+      # Create the primary ingestion topic.
+      # 4 partitions: allows up to 4 Flink subtasks to consume in parallel.
+      kafka-topics --create --if-not-exists \
+        --bootstrap-server kafka:9092 \
+        --topic raw-transactions \
+        --partitions 4 \
+        --replication-factor 1 \
+        --config retention.ms=86400000 \
+        --config cleanup.policy=delete
+
+      # Tier 1 output: Transactions flagged as suspicious.
+      kafka-topics --create --if-not-exists \
+        --bootstrap-server kafka:9092 \
+        --topic suspicious-log \
+        --partitions 4 \
+        --replication-factor 1 \
+        --config retention.ms=86400000
+
+      # Tier 1 output: Transactions cleared by the velocity window check.
+      kafka-topics --create --if-not-exists \
+        --bootstrap-server kafka:9092 \
+        --topic cleared-log \
+        --partitions 4 \
+        --replication-factor 1 \
+        --config retention.ms=86400000
+
+      # Tier 2 output: Confirmed fraud ring alerts.
+      kafka-topics --create --if-not-exists \
+        --bootstrap-server kafka:9092 \
+        --topic fraud-alerts \
+        --partitions 2 \
+        --replication-factor 1 \
+        --config retention.ms=172800000
+
+      # Benchmarking metrics topic (single partition — ordered metric stream).
+      kafka-topics --create --if-not-exists \
+        --bootstrap-server kafka:9092 \
+        --topic benchmark-metrics \
+        --partitions 1 \
+        --replication-factor 1 \
+        --config retention.ms=172800000
+
+      echo ''
+      echo '=========================================='
+      echo 'StreamGraph: All topics created.'
+      echo '=========================================='
+      kafka-topics --list --bootstrap-server kafka:9092
+      "
+    restart: "no"
+
+  # ===========================================================================
+  # APACHE FLINK — JobManager (Master Node)
+  # ===========================================================================
+  # The JobManager is the control plane of the Flink cluster. It is responsible
+  # for:
+  # 1. JOB SCHEDULING: Accepting job submissions, constructing the JobGraph
+  #    (DAG of operators), and distributing tasks to TaskManagers.
+  # 2. CHECKPOINT COORDINATION: Triggering periodic checkpoint barriers that
+  #    flow through the data stream (Chandy-Lamport algorithm). When all
+  #    barriers are acknowledged, the global snapshot is committed.
+  # 3. FAILURE RECOVERY: Detecting TaskManager failures and rescheduling tasks
+  #    from the latest completed checkpoint.
+  #
+  # FOR THE IEEE PAPER: Flink's checkpoint mechanism implements the
+  # Chandy-Lamport distributed snapshot algorithm, providing exactly-once
+  # processing guarantees without stop-the-world pauses. Combined with Kafka's
+  # consumer offset management, this enables end-to-end exactly-once semantics.
+  #
+  # ROCKSDB STATE BACKEND CONFIGURATION:
+  # RocksDB is an embedded key-value store (LSM-tree based) that stores keyed
+  # state on local disk rather than in JVM heap memory. This is critical for
+  # our use case because:
+  # - Our sliding windows maintain per-account state that can grow with the
+  #   number of unique accounts (potentially millions in a real deployment).
+  # - RocksDB supports incremental checkpointing: only the SST files that
+  #   changed since the last checkpoint are uploaded, dramatically reducing
+  #   checkpoint I/O for large state.
+  # - JVM heap-based state backends suffer from GC pressure at scale;
+  #   RocksDB's off-heap storage avoids this entirely.
+  # ===========================================================================
+  flink-jobmanager:
+    image: flink:1.18.1-scala_2.12-java11
+    container_name: streamgraph-flink-jobmanager
+    hostname: flink-jobmanager
+    networks:
+      - streamgraph-net
+    ports:
+      # Flink Web Dashboard — monitoring, job submission, metrics.
+      - "8081:8081"
+    environment:
+      # -----------------------------------------------------------------------
+      # FLINK CONFIGURATION (via environment variables)
+      # -----------------------------------------------------------------------
+      # FLINK_PROPERTIES is a special env var that appends to flink-conf.yaml.
+      # This is the idiomatic way to configure Flink in Docker.
+      # -----------------------------------------------------------------------
+      FLINK_PROPERTIES: |
+        # --- CLUSTER IDENTITY ---
+        jobmanager.rpc.address: flink-jobmanager
+        jobmanager.rpc.port: 6123
+
+        # --- MEMORY CONFIGURATION ---
+        # JobManager memory: 1.5 GB total (includes JVM overhead).
+        jobmanager.memory.process.size: 1600m
+
+        # --- STATE BACKEND: ROCKSDB ---
+        # Explicitly set RocksDB as the state backend. This is the single most
+        # important configuration for our architecture — it ensures that Flink
+        # stores keyed state (our velocity windows) in RocksDB's LSM-tree on
+        # local disk, not in JVM heap memory.
+        state.backend: rocksdb
+
+        # Enable incremental checkpointing. Without this, every checkpoint
+        # would serialize the ENTIRE RocksDB state, which is O(state_size).
+        # With incremental checkpointing, only the delta (new/modified SST
+        # files) is uploaded, making it O(delta_size) — typically orders of
+        # magnitude smaller.
+        state.backend.incremental: true
+
+        # RocksDB timer service implementation: use RocksDB for timer state
+        # as well (not heap). Ensures all state is consistently managed by
+        # the same backend.
+        state.backend.rocksdb.timer-service.factory: rocksdb
+
+        # --- CHECKPOINT CONFIGURATION ---
+        # Checkpoint storage: filesystem-based (local for this prototype).
+        # In production, this would point to HDFS or S3.
+        state.checkpoints.dir: file:///opt/flink/checkpoints
+        state.savepoints.dir: file:///opt/flink/savepoints
+
+        # Checkpoint interval: 60 seconds.
+        # Trade-off: More frequent = lower data loss on failure but higher I/O.
+        # 60s is a reasonable balance for a research prototype.
+        execution.checkpointing.interval: 60000
+
+        # Checkpoint mode: EXACTLY_ONCE.
+        # This enables barrier alignment, ensuring that each checkpoint
+        # captures a consistent global snapshot across all parallel operators.
+        execution.checkpointing.mode: EXACTLY_ONCE
+
+        # Minimum pause between checkpoints: 30 seconds.
+        # Prevents checkpoint storms when individual checkpoints take too long.
+        execution.checkpointing.min-pause: 30000
+
+        # Checkpoint timeout: 120 seconds.
+        # If a checkpoint hasn't completed in 2 minutes, it's aborted.
+        execution.checkpointing.timeout: 120000
+
+        # Tolerate 3 consecutive checkpoint failures before failing the job.
+        execution.checkpointing.tolerable-failed-checkpoints: 3
+
+        # --- PARALLELISM ---
+        # Default parallelism: 2 (matching our 2 TaskManager task slots).
+        # This determines how many parallel instances of each operator run.
+        parallelism.default: 2
+
+        # --- REST API ---
+        rest.port: 8081
+        rest.address: 0.0.0.0
+        rest.bind-address: 0.0.0.0
+
+        # --- WEB DASHBOARD ---
+        web.submit.enable: true
+        web.cancel.enable: true
+
+    command: jobmanager
+    volumes:
+      # Mount checkpoint directory for persistence across container restarts.
+      - flink-checkpoints:/opt/flink/checkpoints
+      # Mount the application code directory so we can submit PyFlink jobs.
+      - ./src:/opt/flink/usrlib
+    healthcheck:
+      test: [ "CMD-SHELL", "curl -sf http://localhost:8081/overview || exit 1" ]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+    restart: unless-stopped
+
+  # ===========================================================================
+  # APACHE FLINK — TaskManager (Worker Node)
+  # ===========================================================================
+  # The TaskManager is the data plane of the Flink cluster. It:
+  # 1. Executes the actual operator logic (our KeyedProcessFunction).
+  # 2. Manages local state (RocksDB instances) for assigned key groups.
+  # 3. Participates in the checkpoint protocol by snapshotting local state
+  #    when checkpoint barriers arrive.
+  #
+  # RESOURCE ALLOCATION:
+  # - numberOfTaskSlots: 2. Each slot can run one parallel pipeline.
+  #   With parallelism=2 and 2 slots, all subtasks fit on this single
+  #   TaskManager. In production, you'd scale horizontally with multiple
+  #   TaskManagers.
+  # - Memory: 2 GB total. RocksDB uses off-heap (managed) memory; we allocate
+  #   generously to avoid OOM during large state accumulation.
+  # ===========================================================================
+  flink-taskmanager:
+    image: flink:1.18.1-scala_2.12-java11
+    container_name: streamgraph-flink-taskmanager
+    hostname: flink-taskmanager
+    networks:
+      - streamgraph-net
+    environment:
+      FLINK_PROPERTIES: |
+        # --- CLUSTER IDENTITY ---
+        jobmanager.rpc.address: flink-jobmanager
+        jobmanager.rpc.port: 6123
+
+        # --- MEMORY CONFIGURATION ---
+        # TaskManager memory: 2 GB total.
+        # This includes JVM heap, off-heap (managed) memory for RocksDB,
+        # network buffers, and JVM metaspace.
+        taskmanager.memory.process.size: 2048m
+
+        # Managed memory fraction: 40% of total memory is allocated to
+        # RocksDB. This controls the block cache size and write buffer
+        # memory for RocksDB instances.
+        taskmanager.memory.managed.fraction: 0.4
+
+        # --- TASK SLOTS ---
+        # Number of parallel task slots on this TaskManager.
+        # Each slot provides an isolated execution thread for a subtask.
+        taskmanager.numberOfTaskSlots: 2
+
+        # --- STATE BACKEND: ROCKSDB ---
+        # Must mirror the JobManager's state backend configuration.
+        state.backend: rocksdb
+        state.backend.incremental: true
+        state.backend.rocksdb.timer-service.factory: rocksdb
+
+        # --- CHECKPOINT PATHS ---
+        state.checkpoints.dir: file:///opt/flink/checkpoints
+        state.savepoints.dir: file:///opt/flink/savepoints
+
+        # --- CHECKPOINT CONFIG (must match JobManager) ---
+        execution.checkpointing.interval: 60000
+        execution.checkpointing.mode: EXACTLY_ONCE
+        execution.checkpointing.min-pause: 30000
+        execution.checkpointing.timeout: 120000
+
+        # --- PARALLELISM ---
+        parallelism.default: 2
+
+        # --- NETWORK BUFFERS ---
+        # Network buffer memory for shuffle/exchange between operators.
+        # Flink uses network buffers for credit-based flow control.
+        taskmanager.memory.network.fraction: 0.1
+        taskmanager.memory.network.min: 64mb
+        taskmanager.memory.network.max: 256mb
+
+    command: taskmanager
+    volumes:
+      - flink-checkpoints:/opt/flink/checkpoints
+      - ./src:/opt/flink/usrlib
+    depends_on:
+      flink-jobmanager:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ===========================================================================
+  # NEO4J — Property Graph Database (Tier 2: Structural Anomaly Detection)
+  # ===========================================================================
+  # Neo4j is our Tier 2 state store, handling the deep graph queries that
+  # detect fraud rings (cyclic transaction paths).
+  #
+  # WHY A GRAPH DATABASE FOR FRAUD DETECTION?
+  # Traditional RDBMS require recursive CTEs or multiple self-joins for cycle
+  # detection, with complexity growing exponentially with path length.
+  # Graph databases use index-free adjacency: each node physically stores
+  # pointers to its neighbors, making traversal O(1) per hop regardless of
+  # total graph size. For our 3-to-5 hop cycle detection:
+  # - RDBMS: O(n^k) where n = nodes, k = hops (join explosion).
+  # - Neo4j: O(d^k) where d = average degree (local traversal).
+  # Since d << n in financial transaction graphs, the graph approach is
+  # orders of magnitude faster for this specific query pattern.
+  #
+  # APOC PLUGIN:
+  # APOC (Awesome Procedures On Cypher) extends Neo4j with utility procedures
+  # including advanced path-finding algorithms, data import/export, and
+  # graph refactoring tools. We enable it for potential use in advanced
+  # cycle detection algorithms (e.g., apoc.path.expandConfig).
+  # ===========================================================================
+  neo4j:
+    image: neo4j:5.19.0
+    container_name: streamgraph-neo4j
+    hostname: neo4j
+    networks:
+      - streamgraph-net
+    ports:
+      # 7474: HTTP API and Neo4j Browser (web UI for interactive queries).
+      - "7474:7474"
+      # 7687: Bolt protocol — the binary protocol used by the neo4j Python
+      # driver for high-performance query execution.
+      - "7687:7687"
+    environment:
+      # -----------------------------------------------------------------------
+      # AUTHENTICATION
+      # -----------------------------------------------------------------------
+      # Default credentials for the research prototype.
+      # In production, these would be injected via Docker secrets.
+      NEO4J_AUTH: neo4j/streamgraph_research_2024
+
+      # -----------------------------------------------------------------------
+      # PLUGIN CONFIGURATION
+      # -----------------------------------------------------------------------
+      # Enable APOC Core plugin and Graph Data Science.
+      NEO4J_PLUGINS: '["apoc", "graph-data-science"]'
+
+      # -----------------------------------------------------------------------
+      # MEMORY CONFIGURATION
+      # -----------------------------------------------------------------------
+      # Heap memory: 1 GB initial and max.
+      # The JVM heap stores transaction state, query execution plans, and
+      # intermediate results during Cypher query evaluation.
+      NEO4J_server_memory_heap_initial__size: "512m"
+      NEO4J_server_memory_heap_max__size: "1g"
+
+      # Page cache: 512 MB.
+      # The page cache maps portions of the store files into memory for
+      # fast read access. For our cycle detection queries, having the
+      # relationship store in page cache is critical for traversal performance.
+      NEO4J_server_memory_pagecache_size: "512m"
+
+      # Transaction memory limit per transaction: 256 MB.
+      # Prevents a single runaway query from consuming all heap memory.
+      NEO4J_db_tx__log_rotation_retention__policy: "2 days"
+
+      # -----------------------------------------------------------------------
+      # NETWORK CONFIGURATION
+      # -----------------------------------------------------------------------
+      # Listen on all interfaces (required for Docker networking).
+      NEO4J_server_default__listen__address: "0.0.0.0"
+      NEO4J_server_bolt_listen__address: "0.0.0.0:7687"
+      NEO4J_server_http_listen__address: "0.0.0.0:7474"
+
+      # Advertised addresses (used by drivers to connect).
+      NEO4J_server_bolt_advertised__address: "neo4j:7687"
+
+      # -----------------------------------------------------------------------
+      # APOC CONFIGURATION
+      # -----------------------------------------------------------------------
+      # Allow APOC to use all available procedures.
+      NEO4J_dbms_security_procedures_unrestricted: "apoc.*"
+      NEO4J_dbms_security_procedures_allowlist: "apoc.*"
+
+      # -----------------------------------------------------------------------
+      # PERFORMANCE TUNING
+      # -----------------------------------------------------------------------
+      # Query logging: log queries that take longer than 1 second.
+      # Useful for identifying slow Cypher queries during benchmarking.
+      NEO4J_db_logs_query_enabled: "INFO"
+      NEO4J_db_logs_query_threshold: "1s"
+
+    volumes:
+      - neo4j-data:/data
+      - neo4j-logs:/logs
+    healthcheck:
+      # Verify Neo4j is accepting Cypher queries.
+      test: [ "CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:7474 || exit 1" ]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 40s
+    restart: unless-stopped
+
+  # ===========================================================================
+  # NEO4J SCHEMA INITIALIZER — One-Shot Setup Container
+  # ===========================================================================
+  # This ephemeral container connects to Neo4j and creates:
+  # 1. Uniqueness constraints on User.id and Transaction.id.
+  # 2. Indexes for fast lookups during Cypher traversals.
+  #
+  # WHY CONSTRAINTS AND INDEXES MATTER:
+  # - Uniqueness constraints prevent duplicate nodes during concurrent inserts
+  #   from multiple graph_worker.py instances.
+  # - B-tree indexes on User.id accelerate MATCH clauses in our cycle
+  #   detection query, reducing lookup from O(n) scan to O(log n).
+  # ===========================================================================
+  neo4j-init:
+    image: neo4j:5.19.0
+    container_name: streamgraph-neo4j-init
+    hostname: neo4j-init
+    networks:
+      - streamgraph-net
+    depends_on:
+      neo4j:
+        condition: service_healthy
+    entrypoint: [ "/bin/bash", "-c" ]
+    command: |
+      "
+      echo '=========================================='
+      echo 'StreamGraph: Initializing Neo4j Schema...'
+      echo '=========================================='
+
+      # Wait a few seconds for Neo4j to be fully ready after health check passes.
+      sleep 5
+
+      # Create uniqueness constraint on User.id.
+      # This also implicitly creates a unique index on User.id.
+      cypher-shell -u neo4j -p streamgraph_research_2024 \
+        -a bolt://neo4j:7687 \
+        'CREATE CONSTRAINT user_id_unique IF NOT EXISTS FOR (u:User) REQUIRE u.id IS UNIQUE;'
+
+      echo 'Created constraint: user_id_unique'
+
+      # Create uniqueness constraint on Transaction.id.
+      cypher-shell -u neo4j -p streamgraph_research_2024 \
+        -a bolt://neo4j:7687 \
+        'CREATE CONSTRAINT txn_id_unique IF NOT EXISTS FOR (t:Transaction) REQUIRE t.id IS UNIQUE;'
+
+      echo 'Created constraint: txn_id_unique'
+
+      # Create composite index on Transaction for range queries on timestamp.
+      cypher-shell -u neo4j -p streamgraph_research_2024 \
+        -a bolt://neo4j:7687 \
+        'CREATE INDEX txn_timestamp IF NOT EXISTS FOR (t:Transaction) ON (t.timestamp);'
+
+      echo 'Created index: txn_timestamp'
+
+      # Create index on Transaction.amount for potential range-based queries.
+      cypher-shell -u neo4j -p streamgraph_research_2024 \
+        -a bolt://neo4j:7687 \
+        'CREATE INDEX txn_amount IF NOT EXISTS FOR (t:Transaction) ON (t.amount);'
+
+      echo 'Created index: txn_amount'
+
+      echo ''
+      echo '=========================================='
+      echo 'StreamGraph: Neo4j schema initialized.'
+      echo '=========================================='
+
+      # Verify by listing all constraints and indexes.
+      cypher-shell -u neo4j -p streamgraph_research_2024 \
+        -a bolt://neo4j:7687 \
+        'SHOW CONSTRAINTS;'
+
+      cypher-shell -u neo4j -p streamgraph_research_2024 \
+        -a bolt://neo4j:7687 \
+        'SHOW INDEXES;'
+      "
+    restart: "no"

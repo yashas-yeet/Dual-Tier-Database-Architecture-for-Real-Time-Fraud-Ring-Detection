@@ -1,0 +1,89 @@
+# =============================================================================
+# StreamGraph — Python Dependencies
+# =============================================================================
+# IEEE Research Project: Dual-Tier Database Architecture for Real-Time
+# Financial Fraud Ring Detection
+#
+# DEPENDENCY RATIONALE:
+# Each dependency is selected for a specific architectural role in the
+# StreamGraph pipeline. We pin exact versions to ensure reproducibility —
+# a critical requirement for academic research.
+# =============================================================================
+
+# =============================================================================
+# TIER 1: STREAM PROCESSING (Apache Flink + RocksDB)
+# =============================================================================
+
+# Apache Flink Python SDK (PyFlink).
+# Provides the Python API for Flink's DataStream API, Table API, and
+# configuration of the RocksDB state backend. PyFlink wraps Flink's Java
+# runtime via Py4J, so it has full access to Flink's stateful stream
+# processing capabilities including keyed state, timers, and checkpointing.
+#
+# Version 1.18.1 is chosen to match our Flink Docker image version exactly.
+# Version mismatches between PyFlink and the Flink cluster can cause
+# serialization errors and class-not-found exceptions.
+apache-flink==1.18.1
+
+# =============================================================================
+# MESSAGING: Apache Kafka Client
+# =============================================================================
+
+# Confluent's Kafka Python client (librdkafka-based).
+# We use this for the producer (data ingestion) and the graph_worker consumer.
+# confluent-kafka wraps librdkafka (C library), providing significantly higher
+# throughput and lower latency than the pure-Python kafka-python library.
+#
+# Key capabilities used:
+# - SerializingProducer: For the data generator (producer.py).
+# - DeserializingConsumer: For the Tier 2 graph worker (graph_worker.py).
+# - Idempotent production: Ensures exactly-once delivery to Kafka.
+confluent-kafka==2.4.0
+
+# =============================================================================
+# TIER 2: GRAPH DATABASE (Neo4j)
+# =============================================================================
+
+# Official Neo4j Python driver.
+# Uses the Bolt binary protocol for high-performance communication with Neo4j.
+# Supports connection pooling, transaction management, and async operations.
+#
+# We use this in graph_worker.py to:
+# 1. Insert transaction subgraphs (MERGE operations for idempotency).
+# 2. Execute cycle detection Cypher queries (variable-length path matching).
+# 3. Manage sessions with explicit transaction functions for retry logic.
+neo4j==5.20.0
+
+# =============================================================================
+# DATA PROCESSING & ANALYSIS
+# =============================================================================
+
+# Pandas: Used for reading and preprocessing the PaySim CSV dataset in
+# producer.py. Pandas' chunked CSV reader (read_csv with chunksize) allows
+# us to process large datasets without loading the entire file into memory.
+pandas
+
+# =============================================================================
+# PERFORMANCE INSTRUMENTATION & BENCHMARKING
+# =============================================================================
+
+# Prometheus client: Exposes metrics (latency histograms, throughput counters)
+# in Prometheus format. This allows us to:
+# 1. Collect fine-grained performance data for the IEEE paper.
+# 2. Visualize metrics in Grafana if desired.
+# 3. Compute percentile latencies (p50, p95, p99) from histogram buckets.
+prometheus-client==0.20.0
+
+# =============================================================================
+# UTILITIES
+# =============================================================================
+
+# Python-dotenv: Loads environment variables from a .env file.
+# Used to externalize configuration (Kafka bootstrap servers, Neo4j
+# credentials, topic names) without hardcoding them in source files.
+python-dotenv==1.0.1
+
+# UUID generation is stdlib (uuid module), no external dep needed.
+# JSON serialization is stdlib (json module), no external dep needed.
+# Logging is stdlib (logging module), no external dep needed.
+# Time measurement is stdlib (time module), no external dep needed.
