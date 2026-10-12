@@ -25,15 +25,33 @@ streamgraph/
 ├── docker-compose.yml          # Infrastructure: Kafka, ZooKeeper, Flink, Neo4j
 ├── requirements.txt            # Python dependencies (pinned versions)
 ├── .env                        # Environment configuration
+├── .env.example                # Environment template (version-controlled)
 ├── run_all.bat                 # 1-click start (Windows)
+├── run_all.sh                  # 1-click start (Linux/macOS)
 ├── stop_all.bat                # 1-click stop (Windows)
+├── stop_all.sh                 # 1-click stop (Linux/macOS)
+├── LICENSE                     # MIT License
 ├── src/
+│   ├── __init__.py             # Package init with project metadata
 │   ├── producer.py             # Phase 2: PaySim CSV → Kafka ingestion
 │   ├── stream_processor.py     # Phase 3: PyFlink + RocksDB (Tier 1)
-│   └── graph_worker.py         # Phase 4: Neo4j graph validation (Tier 2)
+│   ├── graph_worker.py         # Phase 4: Neo4j graph validation (Tier 2)
+│   ├── dashboard.py            # Phase 5: Real-time terminal monitoring
+│   └── benchmark_analysis.py   # Phase 5: Chart generation for IEEE paper
+├── tests/
+│   ├── __init__.py             # Test package initialization
+│   ├── test_producer.py        # Tests for PaySim parser, rate limiter, synthetic gen
+│   ├── test_stream_logic.py    # Tests for Tier 1 sliding velocity window rules
+│   ├── test_graph_worker.py    # Tests for Tier 2 graph queries & severity scoring
+│   ├── test_benchmark_analysis.py # Tests for statistical metrics & chart exports
+│   └── run_tests.py            # Automated test suite runner (24 unit/integration tests)
 ├── data/
-│   └── paysim_dataset.csv      # PaySim synthetic financial dataset
-└── benchmarks/                 # Performance metrics (generated at runtime)
+│   ├── paysim_dataset.csv      # PaySim synthetic financial dataset
+│   └── paysim_sample.csv       # PaySim sample dataset for testing
+├── lib/
+│   └── flink-sql-connector-kafka-3.1.0-1.18.jar  # Flink Kafka connector
+└── benchmarks/                 # Performance metrics & charts (generated)
+    └── charts/                 # Publication-ready PNG charts
 ```
 
 ## Prerequisites
@@ -133,7 +151,43 @@ python src/producer.py --csv data/paysim_dataset.csv --tps 0
 
 - **Flink Dashboard** (http://localhost:8081): Monitor stream processing job, task slots, checkpoints.
 - **Neo4j Browser** (http://localhost:7474): Query the transaction graph interactively.
+- **Real-time Dashboard**: `python src/dashboard.py` — live terminal dashboard with TPS, latency, and fraud alerts.
 - **Benchmark output**: Check `benchmarks/` directory for JSON/CSV metrics files.
+
+**Real-Time Dashboard:**
+```bash
+# Launch the live terminal dashboard (updates every 3 seconds)
+python src/dashboard.py
+
+# Custom refresh interval
+python src/dashboard.py --refresh 5
+```
+
+**Benchmark Analysis (IEEE Paper Charts):**
+```bash
+# Generate all charts and summary tables after a pipeline run
+python src/benchmark_analysis.py
+
+# Offline evaluation / Demo (auto-generates synthetic benchmark data and charts)
+python src/benchmark_analysis.py --demo
+
+# Generate from a specific metrics file
+python src/benchmark_analysis.py --input benchmarks/tier2_metrics_20240101_120000.csv
+
+# Summary table only (no charts)
+python src/benchmark_analysis.py --no-charts
+```
+
+Generated charts (saved to `benchmarks/charts/`):
+| Chart | Description |
+|-------|-------------|
+| `tier1_vs_tier2_latency.png` | Box plot: Tier 1 vs. Tier 2 latency comparison |
+| `latency_distribution.png` | Histograms of latency distributions |
+| `throughput_timeline.png` | TPS over time during benchmark run |
+| `e2e_latency_cdf.png` | CDF of end-to-end latency |
+| `speedup_ratio_distribution.png` | Distribution of Tier2/Tier1 cost ratios |
+| `latency_over_time.png` | Scatter plot of per-transaction latency |
+| `summary_table.csv` | Formatted table for the paper |
 
 Example Neo4j queries:
 ```cypher
@@ -213,3 +267,22 @@ If you prefer not to use Docker:
 3. **Kafka (Message Broker)**:
    - **Redpanda**: Download [Redpanda](https://redpanda.com/) (a single lightweight C++ binary replacement for Kafka that runs without ZooKeeper or JVM).
    - **Confluent Cloud (Free Tier)**: Provision a free managed Kafka cluster on Confluent Cloud and update `KAFKA_BOOTSTRAP_SERVERS` in [.env](file:///c:/Users/Yashas%20Vishwakarma/Desktop/project/.env).
+
+## Running Automated Tests
+
+The repository contains an automated test suite (24 unit and integration tests) covering all pipeline layers:
+
+```bash
+# Run the complete test suite
+python tests/run_tests.py
+
+# Or run tests using standard unittest discovery
+python -m unittest discover tests
+```
+
+### Test Coverage
+- **`tests/test_producer.py`**: Validates PaySim CSV streaming parser, token-bucket rate limiter (`TokenBucketRateLimiter`), `ProducerMetrics` tracking, and synthetic transaction generator (`SyntheticPaySimGenerator`).
+- **`tests/test_stream_logic.py`**: Validates Tier 1 temporal anomaly detection rules (transaction count threshold, amount sum threshold, sliding window state eviction).
+- **`tests/test_graph_worker.py`**: Validates Cypher cycle detection query structures (3-hop, 4-hop, 5-hop), severity scoring (`CRITICAL`, `HIGH`, `MEDIUM`), and per-transaction metrics collection.
+- **`tests/test_benchmark_analysis.py`**: Validates latency percentiles computation (p50, p95, p99), throughput aggregation, IEEE summary table generator, and synthetic benchmark generator.
+

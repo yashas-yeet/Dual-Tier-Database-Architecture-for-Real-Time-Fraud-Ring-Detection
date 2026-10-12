@@ -83,6 +83,18 @@ prometheus-client==0.20.0
 # credentials, topic names) without hardcoding them in source files.
 python-dotenv==1.0.1
 
+# =============================================================================
+# VISUALIZATION & CHART GENERATION (for IEEE paper)
+# =============================================================================
+
+# Matplotlib: Used by benchmark_analysis.py to generate publication-ready
+# charts for the IEEE paper's evaluation section. Produces box plots, CDFs,
+# histograms, and time-series charts comparing Tier 1 vs. Tier 2 performance.
+matplotlib>=3.7.0
+
+# =============================================================================
+# NOTES ON STDLIB DEPENDENCIES
+# =============================================================================
 # UUID generation is stdlib (uuid module), no external dep needed.
 # JSON serialization is stdlib (json module), no external dep needed.
 # Logging is stdlib (logging module), no external dep needed.

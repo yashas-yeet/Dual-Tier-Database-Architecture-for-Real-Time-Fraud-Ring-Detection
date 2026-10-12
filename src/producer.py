@@ -51,6 +51,18 @@
 
 import os
 import sys
+from pathlib import Path
+
+# Auto-switch to project virtual environment if running with system Python
+_project_root = Path(__file__).resolve().parent.parent
+_venv_win = _project_root / ".venv" / "Scripts" / "python.exe"
+_venv_nix = _project_root / ".venv" / "bin" / "python"
+_venv_py = _venv_win if _venv_win.exists() else (_venv_nix if _venv_nix.exists() else None)
+
+if _venv_py and Path(sys.executable).resolve() != _venv_py.resolve():
+    import subprocess
+    sys.exit(subprocess.call([str(_venv_py), __file__] + sys.argv[1:]))
+
 import csv
 import json
 import time

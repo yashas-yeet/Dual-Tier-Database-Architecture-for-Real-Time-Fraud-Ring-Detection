@@ -99,10 +99,21 @@
 
 import os
 import sys
+from pathlib import Path
+
+# Auto-switch to project virtual environment if running with system Python
+_project_root = Path(__file__).resolve().parent.parent
+_venv_win = _project_root / ".venv" / "Scripts" / "python.exe"
+_venv_nix = _project_root / ".venv" / "bin" / "python"
+_venv_py = _venv_win if _venv_win.exists() else (_venv_nix if _venv_nix.exists() else None)
+
+if _venv_py and Path(sys.executable).resolve() != _venv_py.resolve():
+    import subprocess
+    sys.exit(subprocess.call([str(_venv_py), __file__] + sys.argv[1:]))
+
 import json
 import time
 import logging
-from pathlib import Path
 
 # =============================================================================
 # PyFlink Imports
@@ -124,6 +135,7 @@ from pyflink.common import (
     Duration,               # Time duration for watermark configuration
     Configuration,          # Flink configuration object
 )
+from pyflink.common.time import Time
 from pyflink.common.serialization import (
     SimpleStringSchema,     # Simple string serializer/deserializer
 )
@@ -466,8 +478,8 @@ class VelocityWindowFunction(KeyedProcessFunction):
         # inactive accounts.
         # =====================================================================
         ttl_config = StateTtlConfig \
-            .new_builder(Duration.of_minutes(
-                (self._window_size_ms // 60000) * 2  # 2x window size
+            .new_builder(Time.minutes(
+                int((self._window_size_ms // 60000) * 2)  # 2x window size
             )) \
             .set_update_type(StateTtlConfig.UpdateType.OnCreateAndWrite) \
             .set_state_visibility(
@@ -957,6 +969,10 @@ def build_and_execute_flink_job():
     # Flink cluster (submitted via flink run). In the Docker setup, this
     # connects to the JobManager via RPC.
     # =========================================================================
+    # Ensure Python UDF worker runs in process mode rather than loopback mode on Windows,
+    # preventing premature process termination during stage bundle factory creation.
+    os.environ["_python_worker_execution_mode"] = "process"
+
     env = StreamExecutionEnvironment.get_execution_environment()
 
     # =========================================================================
@@ -1011,13 +1027,41 @@ def build_and_execute_flink_job():
         savepoint_uri = f"file:///{_savepoint_dir}"
         os.makedirs("./flink-checkpoints", exist_ok=True)
         os.makedirs("./flink-savepoints", exist_ok=True)
+        # Use short path for RocksDB local storage and temp dirs to stay under Windows 247-char path limit
+        os.makedirs("C:/temp/rdb", exist_ok=True)
+        config.set_string("state.backend.rocksdb.localdir", "C:/temp/rdb")
+        config.set_string("io.tmp.dirs", "C:/temp/rdb")
     else:
         checkpoint_uri = "file:///opt/flink/checkpoints"
         savepoint_uri = "file:///opt/flink/savepoints"
 
     config.set_string("state.checkpoints.dir", checkpoint_uri)
     config.set_string("state.savepoints.dir", savepoint_uri)
+
+    # Configure Python executable for PyFlink worker processes so they use the active virtual environment
+    # instead of falling back to system Python (which lacks PyFlink dependencies)
+    py_executable = sys.executable
+    if platform.system() == "Windows":
+        try:
+            import ctypes
+            from ctypes import wintypes
+            _GetShortPathNameW = ctypes.windll.kernel32.GetShortPathNameW
+            _GetShortPathNameW.argtypes = [wintypes.LPCWSTR, wintypes.LPWSTR, wintypes.DWORD]
+            _GetShortPathNameW.restype = wintypes.DWORD
+            buf = ctypes.create_unicode_buffer(1024)
+            if _GetShortPathNameW(sys.executable, buf, 1024) > 0:
+                py_executable = buf.value
+        except Exception:
+            pass
+
+    config.set_string("python.executable", py_executable)
+    config.set_string("python.client.executable", py_executable)
     env.configure(config)
+    try:
+        env.set_python_executable(py_executable)
+    except Exception:
+        pass
+    logger.info(f"PyFlink configured with Python executable: {py_executable}")
 
     # Set parallelism: determines how many parallel instances of each
     # operator are created. Each instance processes a subset of the keys
