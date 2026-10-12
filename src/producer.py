@@ -397,17 +397,34 @@ class PaySimParser:
     # Valid transaction types in PaySim.
     VALID_TYPES = {"CASH_IN", "CASH_OUT", "DEBIT", "PAYMENT", "TRANSFER"}
 
-    def __init__(self, csv_path: str):
+    def __init__(self, csv_path: str, inject_rings: bool = True, ring_interval: int = 350):
         """
         Initialize the parser with the path to the PaySim CSV file.
 
         Args:
             csv_path: Absolute or relative path to the CSV file.
+            inject_rings: If True, interleaves circular fraud ring transactions into the stream.
+            ring_interval: Number of normal transactions between fraud ring injections.
 
         Raises:
             FileNotFoundError: If the CSV file does not exist.
         """
         self.csv_path = Path(csv_path)
+        self.inject_rings = inject_rings
+        self.ring_interval = ring_interval
+        self._ring_counter = 0
+
+        # Coordinated circular fraud rings (3-hop, 4-hop, and 5-hop cycles)
+        self._fraud_rings = [
+            ["C1084920412", "C7749102834", "C3382910482"],  # 3-hop
+            ["C9912048123", "C5581920391", "C2281904812", "C8839102941"],  # 4-hop
+            ["C4491820391", "C6629103948", "C1192840192", "C7738192048", "C9948192038"],  # 5-hop
+            ["C8192019284", "C3301928401", "C5592810492"],  # 3-hop
+            ["C6619284019", "C2291048192", "C8849102938", "C4401928491"],  # 4-hop
+            ["C1102938491", "C5582910482", "C9928104918"],  # 3-hop
+            ["C7728193049", "C3391028491", "C6601928374", "C2281930491"],  # 4-hop
+        ]
+
         if not self.csv_path.exists():
             raise FileNotFoundError(
                 f"PaySim dataset not found at: {self.csv_path.absolute()}\n"
@@ -421,6 +438,7 @@ class PaySimParser:
         logger.info(
             f"PaySim dataset loaded: {self.csv_path.name} "
             f"({self.total_rows:,} transactions)"
+            f"{' [Circular Fraud Ring Injection ACTIVE]' if inject_rings else ''}"
         )
 
     def _count_rows(self) -> int:
@@ -575,6 +593,35 @@ class PaySimParser:
                         continue
 
                     yield transaction
+
+                    # Interleave coordinated circular fraud ring transactions into the live stream
+                    if self.inject_rings and row_num % self.ring_interval == 0:
+                        ring = self._fraud_rings[self._ring_counter % len(self._fraud_rings)]
+                        self._ring_counter += 1
+                        ring_amount = round(random.uniform(15000.0, 48000.0), 2)
+                        step = transaction["step"]
+                        now_ms = int(time.time() * 1000)
+
+                        for i in range(len(ring)):
+                            src = ring[i]
+                            dst = ring[(i + 1) % len(ring)]
+                            yield {
+                                "transaction_id": str(uuid.uuid4()),
+                                "step": step,
+                                "type": "TRANSFER",
+                                "amount": ring_amount,
+                                "nameOrig": src,
+                                "oldbalanceOrg": 60000.0,
+                                "newbalanceOrig": 60000.0 - ring_amount,
+                                "nameDest": dst,
+                                "oldbalanceDest": 10000.0,
+                                "newbalanceDest": 10000.0 + ring_amount,
+                                "isFraud": 1,
+                                "is_fraud_ring": True,
+                                "ring_hop_index": i + 1,
+                                "ring_total_hops": len(ring),
+                                "producer_timestamp_ms": now_ms,
+                            }
 
                 except (ValueError, KeyError) as e:
                     logger.error(
@@ -849,7 +896,7 @@ class StreamGraphProducer:
             self.metrics.record_error()
             return False
 
-    def run(self, csv_path: str, max_messages: int = 0) -> Dict[str, Any]:
+    def run(self, csv_path: str, max_messages: int = 0, inject_rings: bool = True) -> Dict[str, Any]:
         """
         Main ingestion loop. Reads the PaySim CSV and publishes each
         transaction to Kafka.
@@ -857,12 +904,13 @@ class StreamGraphProducer:
         Args:
             csv_path: Path to the PaySim CSV file.
             max_messages: Maximum number of messages to send (0 = all).
+            inject_rings: Whether to interleave circular fraud ring transactions into the stream.
 
         Returns:
             Final performance metrics dictionary.
         """
         # Initialize the CSV parser.
-        parser = PaySimParser(csv_path)
+        parser = PaySimParser(csv_path, inject_rings=inject_rings)
 
         logger.info("=" * 70)
         logger.info("StreamGraph Producer — Starting Ingestion Run")
@@ -1352,6 +1400,21 @@ Examples:
         help="Seconds between periodic metric reports (default: 10).",
     )
 
+    # Fraud ring injection into CSV stream
+    parser.add_argument(
+        "--inject-rings",
+        dest="inject_rings",
+        action="store_true",
+        default=True,
+        help="Interleave coordinated circular fraud rings into CSV stream (default: True).",
+    )
+    parser.add_argument(
+        "--no-inject-rings",
+        dest="inject_rings",
+        action="store_false",
+        help="Disable fraud ring injection into CSV stream.",
+    )
+
     return parser.parse_args()
 
 
@@ -1407,6 +1470,7 @@ def main():
     summary = producer.run(
         csv_path=csv_path,
         max_messages=args.max_messages,
+        inject_rings=args.inject_rings,
     )
 
     # Exit with appropriate code.

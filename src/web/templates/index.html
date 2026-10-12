@@ -44,10 +44,10 @@
         </div>
       </div>
 
-      <!-- Mode Selector -->
-      <div class="mode-toggle">
-        <button id="mode-demo-btn" class="mode-btn active">⚡ Interactive Demo</button>
-        <button id="mode-live-btn" class="mode-btn">🔌 Live Cluster</button>
+      <!-- Live Pipeline Badge -->
+      <div class="live-status-badge">
+        <span class="live-pulse"></span>
+        <span style="font-weight: 700; letter-spacing: 0.05em; color: var(--accent-green); font-size: 0.8rem;">LIVE CLUSTER PIPELINE</span>
       </div>
 
       <!-- Sound FX Toggle -->
@@ -430,32 +430,25 @@
   </main>
 
   <!-- =========================================================================
-       BOTTOM FLOATING DEMO CONTROL TOOLBAR (FOR LIVE PRESENTATION REVIEW)
+       BOTTOM LIVE CLUSTER OPERATIONS STATUS BAR
        ========================================================================= -->
-  <div class="demo-toolbar">
-    <div class="toolbar-label">
-      <span>⚡ Live Demo Controls:</span>
+  <div class="cluster-statusbar">
+    <div class="status-item">
+      <span class="status-indicator online"></span>
+      <span>Kafka Stream: <strong style="color: #fff;">raw-transactions &rarr; suspicious-log &rarr; fraud-alerts</strong></span>
     </div>
-
-    <button id="btn-play-pause" class="btn btn-primary">⏸ Pause</button>
-
-    <div class="speed-control">
-      <span>Speed:</span>
-      <input id="speed-slider" type="range" min="10" max="250" value="50" step="10">
-      <span id="speed-label" style="font-family: var(--font-mono); color: #fff;">50 TPS</span>
+    <div class="status-item">
+      <span class="status-indicator online"></span>
+      <span id="status-flink-info">Flink Tier 1: <strong id="flink-job-label" style="color: #fff;">RocksDB State Backend</strong></span>
     </div>
-
-    <div style="height: 20px; width: 1px; background: var(--border-color);"></div>
-
-    <!-- Quick Injections -->
-    <button class="btn btn-danger" onclick="injectPattern('3hop')">⚡ 3-Hop Ring</button>
-    <button class="btn btn-danger" onclick="injectPattern('4hop')">⚡ 4-Hop Ring</button>
-    <button class="btn" style="color: var(--accent-amber);" onclick="injectPattern('burst')">⚡ Velocity Burst</button>
-    <button class="btn" onclick="injectPattern('normal')">⚡ Normal Batch</button>
-
-    <div style="height: 20px; width: 1px; background: var(--border-color);"></div>
-
-    <button class="btn" onclick="resetAllState()">🧹 Reset</button>
+    <div class="status-item">
+      <span class="status-indicator online"></span>
+      <span id="status-neo4j-info">Neo4j Tier 2: <strong id="neo4j-stats-label" style="color: #fff;">Cypher Traversal & Fraud Rings</strong></span>
+    </div>
+    <div class="status-actions">
+      <button class="btn btn-sm" onclick="fetchGraphFromNeo4j()">🔄 Sync Neo4j Graph</button>
+      <button class="btn btn-sm" onclick="resetAllState()">🧹 Clear Cache</button>
+    </div>
   </div>
 
   <!-- Modal for Full-Res Image Inspection -->

@@ -86,25 +86,31 @@ FLINK_PID=$!
 echo "   Stream Processor started (PID: $FLINK_PID, logging to stream_processor.log)"
 sleep 15
 
-echo "[4/4] Starting Data Producer..."
+echo "[4/5] Starting Live Web Monitoring Console..."
+./.venv/bin/python src/web_ui.py --port 5000 > web_ui.log 2>&1 &
+WEB_PID=$!
+echo "   Live Web UI started (PID: $WEB_PID, http://localhost:5000)"
+sleep 2
+
+echo "[5/5] Starting Data Producer (with circular fraud rings)..."
 if [ -f "data/paysim_dataset.csv" ]; then
-    ./.venv/bin/python src/producer.py --csv data/paysim_dataset.csv --tps 100 > producer.log 2>&1 &
+    ./.venv/bin/python src/producer.py --csv data/paysim_dataset.csv --inject-rings --tps 100 > producer.log 2>&1 &
 elif [ -f "data/paysim_sample.csv" ]; then
-    ./.venv/bin/python src/producer.py --csv data/paysim_sample.csv --tps 100 > producer.log 2>&1 &
+    ./.venv/bin/python src/producer.py --csv data/paysim_sample.csv --inject-rings --tps 100 > producer.log 2>&1 &
 else
-    ./.venv/bin/python src/producer.py --synthetic --num-transactions 10000 --tps 100 > producer.log 2>&1 &
+    ./.venv/bin/python src/producer.py --synthetic --num-transactions 100000 --tps 100 > producer.log 2>&1 &
 fi
 PRODUCER_PID=$!
 echo "   Producer started (PID: $PRODUCER_PID, logging to producer.log)"
 
 echo ""
 echo "==========================================="
-echo " All components started successfully!"
+echo " Live StreamGraph Pipeline Running!"
 echo "==========================================="
 echo " Monitor at:"
-echo "   - Visual Web UI:   http://localhost:5000 (or ./run_ui.sh)"
+echo "   - Visual Web UI:   http://localhost:5000"
 echo "   - Flink Dashboard: http://localhost:8081"
 echo "   - Neo4j Browser:   http://localhost:7474"
 echo ""
-echo " PIDs: Graph Worker=$GRAPH_PID, Stream Processor=$FLINK_PID, Producer=$PRODUCER_PID"
+echo " PIDs: Graph Worker=$GRAPH_PID, Stream Processor=$FLINK_PID, Web UI=$WEB_PID, Producer=$PRODUCER_PID"
 echo " Run ./stop_all.sh to terminate services."

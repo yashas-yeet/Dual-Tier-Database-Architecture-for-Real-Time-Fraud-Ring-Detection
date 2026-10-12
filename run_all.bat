@@ -160,37 +160,49 @@ timeout /t 20 /nobreak >nul
 echo.
 
 REM -------------------------------------------------------------------------
-REM PHASE 2: Start Producer (Data Ingestion)
+REM PHASE 5: Start Live Visual Web Dashboard Console
 REM -------------------------------------------------------------------------
-echo [4/4] Starting Data Producer (Ingestion at 100 TPS)...
+echo [4/5] Starting Live Web Monitoring Console (http://localhost:5000)...
+start "StreamGraph - Live Web UI" /D "%~dp0" cmd /k ".\.venv\Scripts\python.exe src\web_ui.py --port 5000"
+
+echo    Waiting 2 seconds for Web UI server to initialize...
+timeout /t 2 /nobreak >nul
+start http://localhost:5000
+echo.
+
+REM -------------------------------------------------------------------------
+REM PHASE 2: Start Producer (Real PaySim Ingestion at 100 TPS with Fraud Rings)
+REM -------------------------------------------------------------------------
+echo [5/5] Starting Real Data Producer (PaySim Stream + Fraud Rings)...
 if exist "data\paysim_dataset.csv" (
-    echo    Using data\paysim_dataset.csv
-    start "StreamGraph - Producer" /D "%~dp0" cmd /k ".\.venv\Scripts\python.exe src\producer.py --csv data\paysim_dataset.csv --tps 100"
+    echo    Streaming real dataset: data\paysim_dataset.csv with circular fraud rings
+    start "StreamGraph - Producer" /D "%~dp0" cmd /k ".\.venv\Scripts\python.exe src\producer.py --csv data\paysim_dataset.csv --inject-rings --tps 100"
 ) else if exist "data\paysim_sample.csv" (
-    echo    Using data\paysim_sample.csv
-    start "StreamGraph - Producer" /D "%~dp0" cmd /k ".\.venv\Scripts\python.exe src\producer.py --csv data\paysim_sample.csv --tps 100"
+    echo    Streaming sample dataset: data\paysim_sample.csv with circular fraud rings
+    start "StreamGraph - Producer" /D "%~dp0" cmd /k ".\.venv\Scripts\python.exe src\producer.py --csv data\paysim_sample.csv --inject-rings --tps 100"
 ) else (
-    echo    Using built-in synthetic generator
-    start "StreamGraph - Producer" /D "%~dp0" cmd /k ".\.venv\Scripts\python.exe src\producer.py --synthetic --num-transactions 10000 --tps 100"
+    echo    Streaming full synthetic benchmark dataset (50 fraud rings)
+    start "StreamGraph - Producer" /D "%~dp0" cmd /k ".\.venv\Scripts\python.exe src\producer.py --synthetic --num-transactions 100000 --tps 100"
 )
 
 echo.
-echo ===========================================
-echo  All components started successfully!
-echo ===========================================
+echo =====================================================================
+echo  LIVE STREAMGRAPH PIPELINE RUNNING!
+echo =====================================================================
 echo.
-echo  Running in separate windows:
-echo    - Graph Worker     (Tier 2 / Neo4j)
-echo    - Stream Processor (Tier 1 / PyFlink)
-echo    - Producer         (Data Ingestion)
+echo  Active Pipeline Components:
+echo    [1] Tier 2 Graph Worker     (Neo4j Cypher Traversal)
+echo    [2] Tier 1 Stream Processor (Apache Flink x RocksDB)
+echo    [3] Live Visual Web UI      (http://localhost:5000)
+echo    [4] Real Data Producer      (PaySim Ingestion at 100 TPS)
 echo.
-echo  Monitor at:
-echo    - Visual Web UI:   http://localhost:5000 (or run_ui.bat)
-echo    - Flink Dashboard: http://localhost:8081
-echo    - Neo4j Browser:   http://localhost:7474
+echo  Access Dashboards:
+echo    - Live Visual Dashboard: http://localhost:5000
+echo    - Apache Flink Engine:   http://localhost:8081
+echo    - Neo4j Graph Browser:   http://localhost:7474
 echo.
-echo  To stop everything:
-echo    1. Close the 3 Python windows (or Ctrl+C in each)
+echo  To stop the pipeline:
+echo    1. Close the component console windows (or press Ctrl+C in each)
 echo    2. Run: stop_all.bat
 echo.
 pause

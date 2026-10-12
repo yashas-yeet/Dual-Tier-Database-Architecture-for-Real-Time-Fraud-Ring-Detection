@@ -180,6 +180,16 @@ function updateMetricsUI(data) {
     App.elements.flinkDot.className = 'status-dot ' + (data.health?.flink ? 'online' : 'amber');
   }
 
+  // Update Bottom Statusbar live labels
+  const flinkLabel = document.getElementById('flink-job-label');
+  if (flinkLabel && data.health) {
+    flinkLabel.innerText = `${data.health.flink_job || 'PyFlink Window'} (${data.health.flink_status || 'RUNNING'})`;
+  }
+  const neo4jLabel = document.getElementById('neo4j-stats-label');
+  if (neo4jLabel && data.health) {
+    neo4jLabel.innerText = `${data.health.neo4j_users || 0} Users, ${data.health.neo4j_txns || 0} Txns, ${data.health.neo4j_cycles || 0} Rings in DB`;
+  }
+
   // Update Paper Table 1
   updatePaperTable(data);
 }
@@ -624,63 +634,9 @@ window.clearGraphCanvas = function() {
 };
 
 // =============================================================================
-// CONTROLS & INJECTION APIS
+// LIVE CLUSTER CONTROLS & DIRECT NEO4J GRAPH SYNC
 // =============================================================================
 function initControls() {
-  // Play / Pause
-  if (App.elements.btnPlayPause) {
-    App.elements.btnPlayPause.addEventListener('click', () => {
-      App.state.isRunning = !App.state.isRunning;
-      fetch('/api/control', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ action: App.state.isRunning ? 'play' : 'pause' }),
-      });
-      App.elements.btnPlayPause.innerText = App.state.isRunning ? '⏸ Pause' : '▶ Play';
-    });
-  }
-
-  // Speed slider
-  if (App.elements.speedSlider) {
-    App.elements.speedSlider.addEventListener('input', (e) => {
-      const val = Number(e.target.value);
-      App.state.targetTps = val;
-      if (App.elements.speedLabel) App.elements.speedLabel.innerText = `${val} TPS`;
-      fetch('/api/control', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ action: 'set_speed', speed: val }),
-      });
-    });
-  }
-
-  // Mode toggles
-  if (App.elements.modeDemoBtn) {
-    App.elements.modeDemoBtn.addEventListener('click', () => {
-      App.elements.modeDemoBtn.classList.add('active');
-      App.elements.modeLiveBtn.classList.remove('active');
-      App.state.mode = 'demo';
-      fetch('/api/control', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ action: 'set_mode', mode: 'demo' }),
-      });
-    });
-  }
-
-  if (App.elements.modeLiveBtn) {
-    App.elements.modeLiveBtn.addEventListener('click', () => {
-      App.elements.modeLiveBtn.classList.add('active');
-      App.elements.modeDemoBtn.classList.remove('active');
-      App.state.mode = 'live';
-      fetch('/api/control', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ action: 'set_mode', mode: 'live' }),
-      });
-    });
-  }
-
   // Sound FX toggle
   if (App.elements.btnSound) {
     App.elements.btnSound.addEventListener('click', () => {
@@ -695,18 +651,52 @@ function initControls() {
       App.elements.modal.classList.remove('active');
     });
   }
+
+  // Automatically fetch real Neo4j graph on load and periodically
+  fetchGraphFromNeo4j();
+  setInterval(fetchGraphFromNeo4j, 4000);
 }
 
-window.injectPattern = function(type) {
-  fetch('/api/inject', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ type: type }),
-  })
-  .then(res => res.json())
-  .then(data => {
-    console.log('Injected:', data);
-  });
+window.fetchGraphFromNeo4j = function() {
+  fetch('/api/graph')
+    .then(r => r.json())
+    .then(data => {
+      if (!data) return;
+      if (data.nodes && data.nodes.length > 0) {
+        data.nodes.forEach(n => {
+          if (!App.graph.nodeMap.has(n.id)) {
+            const nodeObj = {
+              id: n.id,
+              label: n.label || n.id.slice(0, 8),
+              type: n.type || 'Customer',
+              is_ring: Boolean(n.is_ring),
+              x: (Math.random() - 0.5) * 450,
+              y: (Math.random() - 0.5) * 450,
+              vx: 0,
+              vy: 0,
+            };
+            App.graph.nodes.push(nodeObj);
+            App.graph.nodeMap.set(n.id, nodeObj);
+          } else {
+            const existing = App.graph.nodeMap.get(n.id);
+            if (n.is_ring) existing.is_ring = true;
+          }
+        });
+
+        if (data.links && data.links.length > 0) {
+          data.links.forEach(l => {
+            const exists = App.graph.links.some(k => k.id === l.id);
+            if (!exists) {
+              App.graph.links.push(l);
+            }
+          });
+          if (App.graph.links.length > 150) {
+            App.graph.links = App.graph.links.slice(-150);
+          }
+        }
+      }
+    })
+    .catch(err => console.warn('Neo4j graph fetch error:', err));
 };
 
 window.resetAllState = function() {
@@ -718,6 +708,7 @@ window.resetAllState = function() {
     clearGraphCanvas();
     if (App.elements.txnTableBody) App.elements.txnTableBody.innerHTML = '';
     if (App.elements.alertsTableBody) App.elements.alertsTableBody.innerHTML = '';
+    fetchGraphFromNeo4j();
   });
 };
 
