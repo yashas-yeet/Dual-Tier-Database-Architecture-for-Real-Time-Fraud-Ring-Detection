@@ -26,7 +26,9 @@ streamgraph/
 ├── requirements.txt            # Python dependencies (pinned versions)
 ├── .env                        # Environment configuration
 ├── .env.example                # Environment template (version-controlled)
-├── run_all.bat                 # 1-click start (Windows)
+├── run_ui.bat                  # 1-click start Visual Web Dashboard (Windows)
+├── run_ui.sh                   # 1-click start Visual Web Dashboard (Linux/macOS)
+├── run_all.bat                 # 1-click start Full Pipeline (Windows)
 ├── run_all.sh                  # 1-click start (Linux/macOS)
 ├── stop_all.bat                # 1-click stop (Windows)
 ├── stop_all.sh                 # 1-click stop (Linux/macOS)
@@ -36,8 +38,10 @@ streamgraph/
 │   ├── producer.py             # Phase 2: PaySim CSV → Kafka ingestion
 │   ├── stream_processor.py     # Phase 3: PyFlink + RocksDB (Tier 1)
 │   ├── graph_worker.py         # Phase 4: Neo4j graph validation (Tier 2)
-│   ├── dashboard.py            # Phase 5: Real-time terminal monitoring
-│   └── benchmark_analysis.py   # Phase 5: Chart generation for IEEE paper
+│   ├── web_ui.py               # Phase 5: Interactive Visual Web Dashboard (Flask + SSE)
+│   ├── dashboard.py            # Phase 5: Terminal-based monitoring
+│   ├── benchmark_analysis.py   # Phase 5: Chart generation for IEEE paper
+│   └── web/                    # Web UI frontend assets (Canvas force graph, CSS, templates)
 ├── tests/
 │   ├── __init__.py             # Test package initialization
 │   ├── test_producer.py        # Tests for PaySim parser, rate limiter, synthetic gen
@@ -153,6 +157,23 @@ python src/producer.py --csv data/paysim_dataset.csv --tps 0
 - **Neo4j Browser** (http://localhost:7474): Query the transaction graph interactively.
 - **Real-time Dashboard**: `python src/dashboard.py` — live terminal dashboard with TPS, latency, and fraud alerts.
 - **Benchmark output**: Check `benchmarks/` directory for JSON/CSV metrics files.
+
+**Visual Web Dashboard (Recommended for Reviews & Demos):**
+`ash
+# 1-Click Launch (Windows)
+run_ui.bat
+
+# 1-Click Launch (Linux/macOS)
+./run_ui.sh
+
+# Or start directly with Python
+python src/web_ui.py --port 5000
+`
+Open http://localhost:5000 in your browser to access:
+- **Interactive Force-Directed Fraud Ring Graph**: Animated circular cycles (3-hop, 4-hop, 5-hop) highlighted in radiant crimson, drag & zoom, click-to-inspect Cypher query.
+- **Pipeline Architecture Flow**: Live animated flow of transactions moving across Flink Tier 1 and Neo4j Tier 2.
+- **Dual-Tier Performance Analytics**: Real-time latency distributions, filter efficiency gauge, and IEEE Paper Table 1.
+- **Presentation Demo Controls**: Inject test fraud rings, velocity bursts, or normal batches on demand with 1 click!
 
 **Real-Time Dashboard:**
 ```bash

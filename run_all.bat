@@ -185,6 +185,7 @@ echo    - Stream Processor (Tier 1 / PyFlink)
 echo    - Producer         (Data Ingestion)
 echo.
 echo  Monitor at:
+echo    - Visual Web UI:   http://localhost:5000 (or run_ui.bat)
 echo    - Flink Dashboard: http://localhost:8081
 echo    - Neo4j Browser:   http://localhost:7474
 echo.

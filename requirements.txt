@@ -92,6 +92,10 @@ python-dotenv==1.0.1
 # histograms, and time-series charts comparing Tier 1 vs. Tier 2 performance.
 matplotlib>=3.7.0
 
+# Flask: Web framework powering the real-time StreamGraph visual monitoring UI.
+# Provides interactive graph visualization, live streaming metrics, and demo controls.
+Flask>=3.0.0
+
 # =============================================================================
 # NOTES ON STDLIB DEPENDENCIES
 # =============================================================================

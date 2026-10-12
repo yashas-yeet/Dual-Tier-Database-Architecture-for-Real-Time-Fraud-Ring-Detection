@@ -1,0 +1,468 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>StreamGraph — Real-Time Fraud Ring Detection</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/static/css/style.css">
+</head>
+<body>
+
+  <!-- =========================================================================
+       HEADER NAVIGATION & STATUS BAR
+       ========================================================================= -->
+  <header class="header">
+    <div class="brand">
+      <div class="brand-icon">
+        <svg viewBox="0 0 24 24">
+          <path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5"/>
+        </svg>
+      </div>
+      <div class="brand-text">
+        <h1>StreamGraph <span class="brand-badge">Dual-Tier</span></h1>
+        <p>Real-Time Fraud Ring Detection (Flink/RocksDB × Neo4j Cypher Traversal)</p>
+      </div>
+    </div>
+
+    <div class="header-controls">
+      <!-- Cluster / Service Health Pills -->
+      <div class="service-pills">
+        <div class="pill">
+          <span id="flink-dot" class="status-dot"></span>
+          <span>Flink (Tier 1)</span>
+        </div>
+        <div class="pill">
+          <span id="neo4j-dot" class="status-dot"></span>
+          <span>Neo4j (Tier 2)</span>
+        </div>
+        <div class="pill">
+          <span id="kafka-dot" class="status-dot"></span>
+          <span>Kafka</span>
+        </div>
+      </div>
+
+      <!-- Mode Selector -->
+      <div class="mode-toggle">
+        <button id="mode-demo-btn" class="mode-btn active">⚡ Interactive Demo</button>
+        <button id="mode-live-btn" class="mode-btn">🔌 Live Cluster</button>
+      </div>
+
+      <!-- Sound FX Toggle -->
+      <button id="btn-sound" class="btn" style="padding: 0.35rem 0.75rem; font-size: 0.75rem;">🔔 Sound On</button>
+    </div>
+  </header>
+
+  <!-- =========================================================================
+       HERO KPI METRICS RIBBON (6 GLOWING METRIC CARDS)
+       ========================================================================= -->
+  <section class="kpi-container">
+    <!-- Card 1: Throughput -->
+    <div class="kpi-card throughput">
+      <div class="kpi-header">
+        <span class="kpi-title">Throughput</span>
+        <span class="kpi-tag">REAL-TIME</span>
+      </div>
+      <div class="kpi-value"><span id="kpi-tps">50.0</span> <span class="kpi-unit">TPS</span></div>
+      <div class="kpi-subtext">Total: <strong id="kpi-total">0</strong> records</div>
+    </div>
+
+    <!-- Card 2: Tier 1 Latency -->
+    <div class="kpi-card tier1">
+      <div class="kpi-header">
+        <span class="kpi-title">Tier 1: Flink Latency</span>
+        <span class="kpi-tag">O(1) STATE</span>
+      </div>
+      <div class="kpi-value"><span id="kpi-t1-latency">1.34</span> <span class="kpi-unit">ms</span></div>
+      <div class="kpi-subtext">15-min Sliding Velocity Window</div>
+    </div>
+
+    <!-- Card 3: Tier 2 Latency -->
+    <div class="kpi-card tier2">
+      <div class="kpi-header">
+        <span class="kpi-title">Tier 2: Neo4j Latency</span>
+        <span class="kpi-tag">O(d^k) GRAPH</span>
+      </div>
+      <div class="kpi-value"><span id="kpi-t2-latency">24.20</span> <span class="kpi-unit">ms</span></div>
+      <div class="kpi-subtext">Insert + Cypher Cycle Traversal</div>
+    </div>
+
+    <!-- Card 4: Filter Efficiency -->
+    <div class="kpi-card filter">
+      <div class="kpi-header">
+        <span class="kpi-title">Filter Efficiency</span>
+        <span class="kpi-tag">SAVINGS</span>
+      </div>
+      <div class="kpi-value"><span id="kpi-filter-ratio">96.5%</span></div>
+      <div class="kpi-subtext">Bypasses Expensive Graph DB</div>
+    </div>
+
+    <!-- Card 5: Fraud Rings Detected -->
+    <div class="kpi-card rings">
+      <div class="kpi-header">
+        <span class="kpi-title">Fraud Rings Found</span>
+        <span class="kpi-tag">ALERTS</span>
+      </div>
+      <div class="kpi-value" style="color: var(--accent-red);"><span id="kpi-rings-count">0</span></div>
+      <div class="kpi-subtext">3 to 5-Hop Circular Cycles</div>
+    </div>
+
+    <!-- Card 6: Speedup Ratio -->
+    <div class="kpi-card speedup">
+      <div class="kpi-header">
+        <span class="kpi-title">Speedup Ratio</span>
+        <span class="kpi-tag">IEEE THESIS</span>
+      </div>
+      <div class="kpi-value" style="color: var(--accent-amber);"><span id="kpi-speedup">18.7×</span></div>
+      <div class="kpi-subtext">Tier 1 Faster than Graph</div>
+    </div>
+  </section>
+
+  <!-- =========================================================================
+       TAB NAVIGATION
+       ========================================================================= -->
+  <nav class="tabs-nav">
+    <button class="tab-btn active" data-tab="tab-flow">
+      <svg width="16" height="16" fill="currentColor" viewBox="0 0 24 24"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-1 14H9v-2h2v2zm0-4H9V7h2v5z"/></svg>
+      Pipeline Architecture Flow
+    </button>
+    <button class="tab-btn" data-tab="tab-graph">
+      <svg width="16" height="16" fill="currentColor" viewBox="0 0 24 24"><path d="M12 2a10 10 0 1 0 10 10A10 10 0 0 0 12 2zm1 15h-2v-6h2zm0-8h-2V7h2z"/></svg>
+      Interactive Fraud Ring Graph
+    </button>
+    <button class="tab-btn" data-tab="tab-perf">
+      <svg width="16" height="16" fill="currentColor" viewBox="0 0 24 24"><path d="M5 9.2h3V19H5zM10.6 5h2.8v14h-2.8zm5.6 8H19v6h-2.8z"/></svg>
+      Dual-Tier Latency & Performance
+    </button>
+    <button class="tab-btn" data-tab="tab-alerts">
+      <svg width="16" height="16" fill="currentColor" viewBox="0 0 24 24"><path d="M12 22c1.1 0 2-.9 2-2h-4c0 1.1.9 2 2 2zm6-6v-5c0-3.07-1.63-5.64-4.5-6.32V4c0-.83-.67-1.5-1.5-1.5s-1.5.67-1.5 1.5v.68C7.64 5.36 6 7.92 6 11v5l-2 2v1h16v-1l-2-2z"/></svg>
+      Fraud Alerts & Ring Forensic Log
+    </button>
+    <button class="tab-btn" data-tab="tab-benchmarks">
+      <svg width="16" height="16" fill="currentColor" viewBox="0 0 24 24"><path d="M19 3H5c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h14c1.1 0 2-.9 2-2V5c0-1.1-.9-2-2-2zm-5 14H7v-2h7v2zm3-4H7v-2h10v2zm0-4H7V7h10v2z"/></svg>
+      IEEE Paper Evaluation & Charts
+    </button>
+  </nav>
+
+  <!-- =========================================================================
+       MAIN VIEWPORT
+       ========================================================================= -->
+  <main class="main-content">
+
+    <!-- -----------------------------------------------------------------------
+         TAB 1: PIPELINE ARCHITECTURE FLOW & LIVE STREAM FEED
+         ----------------------------------------------------------------------- -->
+    <div id="tab-flow" class="tab-pane active">
+      <!-- Interactive Architecture Flow Diagram -->
+      <div class="flow-diagram-container">
+        <div class="flow-title">
+          <span>End-to-End Dual-Tier Data Flow</span>
+          <span style="font-family: var(--font-mono); color: var(--primary);">Live Pulse Active</span>
+        </div>
+
+        <div class="pipeline-flow">
+          <!-- Stage 1: Ingestion -->
+          <div class="flow-node producer">
+            <div class="flow-node-title">1. Data Ingestion</div>
+            <div class="flow-node-tech">PaySim CSV / Producer</div>
+            <div id="flow-tps" class="flow-node-metric">50.0 TPS</div>
+          </div>
+
+          <div class="flow-arrow">➔</div>
+
+          <!-- Stage 2: Kafka Broker -->
+          <div class="flow-node">
+            <div class="flow-node-title">2. Message Broker</div>
+            <div class="flow-node-tech">Kafka: raw-transactions</div>
+            <div class="flow-node-metric">Partitioned Stream</div>
+          </div>
+
+          <div class="flow-arrow">➔</div>
+
+          <!-- Stage 3: Tier 1 Flink -->
+          <div class="flow-node tier1">
+            <div class="flow-node-title">3. Tier 1: Flink + RocksDB</div>
+            <div class="flow-node-tech">15-min Sliding Window</div>
+            <div id="flow-t1-processed" class="flow-node-metric">~96% Cleared</div>
+          </div>
+
+          <div class="flow-arrow">➔</div>
+
+          <!-- Stage 4: Tier 2 Neo4j -->
+          <div class="flow-node tier2">
+            <div class="flow-node-title">4. Tier 2: Neo4j Graph</div>
+            <div class="flow-node-tech">Cypher Cycle Traversal</div>
+            <div id="flow-t2-processed" class="flow-node-metric">~4% Suspicious</div>
+          </div>
+
+          <div class="flow-arrow">➔</div>
+
+          <!-- Stage 5: Alert Dispatcher -->
+          <div class="flow-node alert">
+            <div class="flow-node-title">5. Alert Dispatcher</div>
+            <div class="flow-node-tech">fraud-alerts Topic</div>
+            <div id="flow-alerts-count" class="flow-node-metric">0 Rings Found</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Feed Grid -->
+      <div class="feed-grid">
+        <!-- Live Transactions Table -->
+        <div class="feed-card">
+          <div class="feed-header">
+            <h3>Live Transaction Stream Feed</h3>
+            <span style="font-size: 0.72rem; color: var(--text-muted);">Real-Time sliding window audit</span>
+          </div>
+          <div class="table-wrapper">
+            <table class="data-table">
+              <thead>
+                <tr>
+                  <th>Time</th>
+                  <th>Tx ID</th>
+                  <th>Type</th>
+                  <th>Amount</th>
+                  <th>Origin</th>
+                  <th>Destination</th>
+                  <th>Tier 1 (Temporal)</th>
+                  <th>Tier 2 (Graph)</th>
+                  <th>Latency</th>
+                </tr>
+              </thead>
+              <tbody id="txn-table-body">
+                <!-- Dynamically populated -->
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+        <!-- Architectural Overview Insight Card -->
+        <div class="feed-card">
+          <div class="feed-header">
+            <h3>Architectural Key Insight</h3>
+          </div>
+          <div style="font-size: 0.8rem; line-height: 1.6; color: var(--text-muted); display: flex; flex-direction: column; gap: 0.75rem;">
+            <p>
+              Graph cycle detection in financial networks has exponential complexity 
+              <strong style="color: #fff;">O(d<sup>k</sup>)</strong>, where <em style="color: var(--primary);">d</em> is average account degree and <em style="color: var(--primary);">k</em> is ring hop count.
+            </p>
+            <p>
+              In our IEEE paper architecture, 
+              <strong style="color: var(--accent-green);">Tier 1 (Apache Flink with RocksDB)</strong> 
+              filters <strong style="color: #fff;">~96.5%</strong> of transactions cheaply using an <strong style="color: var(--primary);">O(1)</strong> state lookup per record.
+            </p>
+            <p>
+              Only the suspicious <strong style="color: var(--accent-amber);">~3.5%</strong> are forwarded to 
+              <strong style="color: var(--secondary);">Tier 2 (Neo4j)</strong> for graph traversal. 
+              This achieves an <strong style="color: var(--accent-amber);">18.7× speedup</strong> while eliminating 99% of graph query load!
+            </p>
+            <div style="margin-top: 0.5rem; padding: 0.75rem; background: rgba(0, 245, 255, 0.05); border: 1px solid rgba(0, 245, 255, 0.2); border-radius: var(--radius-sm);">
+              <span style="font-size: 0.72rem; color: var(--primary); font-weight: 700;">PROVABLE COMPLEXITY REDUCTION:</span>
+              <div style="font-family: var(--font-mono); font-size: 0.72rem; margin-top: 4px; color: #fff;">
+                Without Tier 1: 100,000 txns × 25ms = 2,500 sec<br>
+                With Dual-Tier: 96.5k × 1.3ms + 3.5k × 25ms = 213 sec (11.7x faster)
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- -----------------------------------------------------------------------
+         TAB 2: INTERACTIVE FRAUD RING GRAPH VISUALIZER
+         ----------------------------------------------------------------------- -->
+    <div id="tab-graph" class="tab-pane">
+      <div class="graph-viewport-container">
+        <!-- Canvas Card -->
+        <div class="graph-canvas-card">
+          <!-- Canvas Overlay Tools -->
+          <div class="graph-overlay-tools">
+            <button class="overlay-btn" onclick="zoomGraph(1.2)">🔍 Zoom In</button>
+            <button class="overlay-btn" onclick="zoomGraph(0.8)">🔍 Zoom Out</button>
+            <button class="overlay-btn" onclick="resetGraphCamera()">🎯 Center View</button>
+            <button class="overlay-btn" onclick="clearGraphCanvas()">🧹 Clear Canvas</button>
+          </div>
+
+          <!-- Canvas Element -->
+          <canvas id="network-canvas"></canvas>
+
+          <!-- Graph Legend -->
+          <div class="graph-legend">
+            <div class="legend-item">
+              <span class="legend-color" style="background: var(--primary); box-shadow: 0 0 6px var(--primary);"></span>
+              <span>Customer Account</span>
+            </div>
+            <div class="legend-item">
+              <span class="legend-color" style="background: var(--secondary); box-shadow: 0 0 6px var(--secondary);"></span>
+              <span>Merchant Account</span>
+            </div>
+            <div class="legend-item">
+              <span class="legend-color" style="background: var(--accent-red); box-shadow: 0 0 8px var(--accent-red);"></span>
+              <span>Fraud Ring Cycle (3-5 Hops)</span>
+            </div>
+          </div>
+        </div>
+
+        <!-- Graph Inspector Drawer -->
+        <div class="graph-details-card">
+          <h3>Account & Ring Inspector</h3>
+
+          <div id="detail-ring-banner" style="display: none; padding: 0.5rem; background: rgba(239, 68, 68, 0.2); border: 1px solid var(--accent-red); border-radius: var(--radius-sm); margin-bottom: 1rem;">
+            <strong style="color: var(--accent-red); font-size: 0.75rem;">🚨 CRITICAL FRAUD RING DETECTED</strong>
+          </div>
+
+          <div class="detail-block">
+            <div class="detail-label">Selected Account / Ring</div>
+            <div id="detail-account-id" class="detail-value" style="color: var(--primary); word-break: break-all;">No account selected</div>
+          </div>
+
+          <div class="detail-block">
+            <div class="detail-label">Account Classification</div>
+            <div id="detail-type" class="detail-value">Customer</div>
+          </div>
+
+          <div class="detail-block">
+            <div class="detail-label">Transaction Activity</div>
+            <div id="detail-tx-count" class="detail-value">0 transactions</div>
+          </div>
+
+          <div class="detail-block">
+            <div class="detail-label">Total Transacted Volume</div>
+            <div id="detail-volume" class="detail-value" style="font-weight: 700; color: #fff;">$0.00</div>
+          </div>
+
+          <div class="detail-block">
+            <div class="detail-label">Cypher Traversal Query (Neo4j Tier 2)</div>
+            <div id="detail-cypher" class="code-box">MATCH (u:User)-[r]-(t:Transaction) RETURN u, r, t LIMIT 25;</div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- -----------------------------------------------------------------------
+         TAB 3: DUAL-TIER LATENCY & PERFORMANCE
+         ----------------------------------------------------------------------- -->
+    <div id="tab-perf" class="tab-pane">
+      <div class="perf-grid">
+        <div class="chart-card">
+          <h3>Tier 1 vs. Tier 2 Latency Distribution (ms)</h3>
+          <div class="chart-wrapper">
+            <canvas id="chart-latency-canvas" width="450" height="240"></canvas>
+          </div>
+        </div>
+
+        <div class="chart-card">
+          <h3>Tier 1 Temporal Filter Breakdown</h3>
+          <div class="chart-wrapper">
+            <canvas id="chart-percentile-canvas" width="450" height="240"></canvas>
+          </div>
+        </div>
+      </div>
+
+      <!-- IEEE Table 1 -->
+      <div class="paper-table-card">
+        <h3>IEEE Paper Table 1: Dual-Tier Latency Benchmark Summary</h3>
+        <p>Direct comparison of Tier 1 (Flink/RocksDB) vs Tier 2 (Neo4j) across percentiles.</p>
+        <table class="data-table">
+          <thead>
+            <tr>
+              <th>Pipeline Layer</th>
+              <th>Sample Count</th>
+              <th>Mean Latency</th>
+              <th>Median (p50)</th>
+              <th>p95 Latency</th>
+              <th>p99 Latency</th>
+              <th>Algorithmic Class</th>
+            </tr>
+          </thead>
+          <tbody id="paper-table-body">
+            <!-- Dynamically populated from SSE -->
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    <!-- -----------------------------------------------------------------------
+         TAB 4: FRAUD ALERTS & RING FORENSIC LOG
+         ----------------------------------------------------------------------- -->
+    <div id="tab-alerts" class="tab-pane">
+      <div class="feed-card" style="height: 100%;">
+        <div class="feed-header">
+          <h3>Detected Fraud Ring Forensic Log</h3>
+          <span style="font-size: 0.72rem; color: var(--text-muted);">Real-time dispatch from fraud-alerts topic</span>
+        </div>
+        <div class="table-wrapper">
+          <table class="data-table">
+            <thead>
+              <tr>
+                <th>Alert ID</th>
+                <th>Timestamp</th>
+                <th>Cycle Hop Count</th>
+                <th>Primary Account</th>
+                <th>Laundered Amount</th>
+                <th>Severity</th>
+                <th>Action</th>
+              </tr>
+            </thead>
+            <tbody id="alerts-table-body">
+              <!-- Dynamically populated -->
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+
+    <!-- -----------------------------------------------------------------------
+         TAB 5: IEEE PAPER EVALUATION & CHARTS GALLERY
+         ----------------------------------------------------------------------- -->
+    <div id="tab-benchmarks" class="tab-pane">
+      <div class="flow-title">
+        <span>Publication-Ready Evaluation Charts (Generated for IEEE Paper)</span>
+        <span style="font-size: 0.75rem; color: var(--primary);">Location: benchmarks/charts/</span>
+      </div>
+      <div id="gallery-container" class="gallery-grid">
+        <!-- Dynamically populated from /api/benchmarks -->
+      </div>
+    </div>
+
+  </main>
+
+  <!-- =========================================================================
+       BOTTOM FLOATING DEMO CONTROL TOOLBAR (FOR LIVE PRESENTATION REVIEW)
+       ========================================================================= -->
+  <div class="demo-toolbar">
+    <div class="toolbar-label">
+      <span>⚡ Live Demo Controls:</span>
+    </div>
+
+    <button id="btn-play-pause" class="btn btn-primary">⏸ Pause</button>
+
+    <div class="speed-control">
+      <span>Speed:</span>
+      <input id="speed-slider" type="range" min="10" max="250" value="50" step="10">
+      <span id="speed-label" style="font-family: var(--font-mono); color: #fff;">50 TPS</span>
+    </div>
+
+    <div style="height: 20px; width: 1px; background: var(--border-color);"></div>
+
+    <!-- Quick Injections -->
+    <button class="btn btn-danger" onclick="injectPattern('3hop')">⚡ 3-Hop Ring</button>
+    <button class="btn btn-danger" onclick="injectPattern('4hop')">⚡ 4-Hop Ring</button>
+    <button class="btn" style="color: var(--accent-amber);" onclick="injectPattern('burst')">⚡ Velocity Burst</button>
+    <button class="btn" onclick="injectPattern('normal')">⚡ Normal Batch</button>
+
+    <div style="height: 20px; width: 1px; background: var(--border-color);"></div>
+
+    <button class="btn" onclick="resetAllState()">🧹 Reset</button>
+  </div>
+
+  <!-- Modal for Full-Res Image Inspection -->
+  <div id="image-modal" class="modal">
+    <img id="modal-img" class="modal-content" src="" alt="Enlarged Chart">
+  </div>
+
+  <script src="/static/js/app.js"></script>
+</body>
+</html>
