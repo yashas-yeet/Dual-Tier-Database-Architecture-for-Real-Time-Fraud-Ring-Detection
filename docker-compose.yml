@@ -31,7 +31,6 @@
 # Docker Compose specification version.
 # We use the Compose Specification (no version key needed for modern Docker
 # Compose v2+), but we include it for broad compatibility.
-version: "3.9"
 
 # =============================================================================
 # NETWORK CONFIGURATION
@@ -53,6 +52,10 @@ networks:
 # - Neo4j data: Retains the property graph (nodes, relationships, indexes).
 # - Flink checkpoints: Retains RocksDB incremental checkpoint snapshots.
 volumes:
+  zookeeper-data:
+    name: streamgraph-zookeeper-data
+  zookeeper-log:
+    name: streamgraph-zookeeper-log
   kafka-data:
     name: streamgraph-kafka-data
   neo4j-data:
@@ -104,6 +107,9 @@ services:
       # JVM heap size — ZooKeeper is metadata-only, 512 MB is generous
       # for a single-broker setup.
       KAFKA_HEAP_OPTS: "-Xmx512m -Xms512m"
+    volumes:
+      - zookeeper-data:/var/lib/zookeeper/data
+      - zookeeper-log:/var/lib/zookeeper/log
     healthcheck:
       # Verify ZooKeeper is accepting client connections by sending
       # the "ruok" (are you OK?) four-letter command.
@@ -254,64 +260,65 @@ services:
     depends_on:
       kafka:
         condition: service_healthy
-    entrypoint: [ "/bin/bash", "-c" ]
-    command: |
-      "
-      echo '=========================================='
-      echo 'StreamGraph: Creating Kafka Topics...'
-      echo '=========================================='
+    entrypoint: []
+    command:
+      - /bin/bash
+      - -c
+      - |
+        echo '=========================================='
+        echo 'StreamGraph: Creating Kafka Topics...'
+        echo '=========================================='
 
-      # Wait for Kafka broker to be fully ready (belt-and-suspenders).
-      cub kafka-ready -b kafka:9092 1 60
+        # Wait for Kafka broker to be fully ready (belt-and-suspenders).
+        cub kafka-ready -b kafka:9092 1 60
 
-      # Create the primary ingestion topic.
-      # 4 partitions: allows up to 4 Flink subtasks to consume in parallel.
-      kafka-topics --create --if-not-exists \
-        --bootstrap-server kafka:9092 \
-        --topic raw-transactions \
-        --partitions 4 \
-        --replication-factor 1 \
-        --config retention.ms=86400000 \
-        --config cleanup.policy=delete
+        # Create the primary ingestion topic.
+        # 4 partitions: allows up to 4 Flink subtasks to consume in parallel.
+        kafka-topics --create --if-not-exists \
+          --bootstrap-server kafka:9092 \
+          --topic raw-transactions \
+          --partitions 4 \
+          --replication-factor 1 \
+          --config retention.ms=86400000 \
+          --config cleanup.policy=delete
 
-      # Tier 1 output: Transactions flagged as suspicious.
-      kafka-topics --create --if-not-exists \
-        --bootstrap-server kafka:9092 \
-        --topic suspicious-log \
-        --partitions 4 \
-        --replication-factor 1 \
-        --config retention.ms=86400000
+        # Tier 1 output: Transactions flagged as suspicious.
+        kafka-topics --create --if-not-exists \
+          --bootstrap-server kafka:9092 \
+          --topic suspicious-log \
+          --partitions 4 \
+          --replication-factor 1 \
+          --config retention.ms=86400000
 
-      # Tier 1 output: Transactions cleared by the velocity window check.
-      kafka-topics --create --if-not-exists \
-        --bootstrap-server kafka:9092 \
-        --topic cleared-log \
-        --partitions 4 \
-        --replication-factor 1 \
-        --config retention.ms=86400000
+        # Tier 1 output: Transactions cleared by the velocity window check.
+        kafka-topics --create --if-not-exists \
+          --bootstrap-server kafka:9092 \
+          --topic cleared-log \
+          --partitions 4 \
+          --replication-factor 1 \
+          --config retention.ms=86400000
 
-      # Tier 2 output: Confirmed fraud ring alerts.
-      kafka-topics --create --if-not-exists \
-        --bootstrap-server kafka:9092 \
-        --topic fraud-alerts \
-        --partitions 2 \
-        --replication-factor 1 \
-        --config retention.ms=172800000
+        # Tier 2 output: Confirmed fraud ring alerts.
+        kafka-topics --create --if-not-exists \
+          --bootstrap-server kafka:9092 \
+          --topic fraud-alerts \
+          --partitions 2 \
+          --replication-factor 1 \
+          --config retention.ms=172800000
 
-      # Benchmarking metrics topic (single partition — ordered metric stream).
-      kafka-topics --create --if-not-exists \
-        --bootstrap-server kafka:9092 \
-        --topic benchmark-metrics \
-        --partitions 1 \
-        --replication-factor 1 \
-        --config retention.ms=172800000
+        # Benchmarking metrics topic (single partition — ordered metric stream).
+        kafka-topics --create --if-not-exists \
+          --bootstrap-server kafka:9092 \
+          --topic benchmark-metrics \
+          --partitions 1 \
+          --replication-factor 1 \
+          --config retention.ms=172800000
 
-      echo ''
-      echo '=========================================='
-      echo 'StreamGraph: All topics created.'
-      echo '=========================================='
-      kafka-topics --list --bootstrap-server kafka:9092
-      "
+        echo ''
+        echo '=========================================='
+        echo 'StreamGraph: All topics created.'
+        echo '=========================================='
+        kafka-topics --list --bootstrap-server kafka:9092
     restart: "no"
 
   # ===========================================================================
@@ -651,57 +658,59 @@ services:
     depends_on:
       neo4j:
         condition: service_healthy
-    entrypoint: [ "/bin/bash", "-c" ]
-    command: |
-      "
-      echo '=========================================='
-      echo 'StreamGraph: Initializing Neo4j Schema...'
-      echo '=========================================='
+    entrypoint: []
+    command:
+      - /bin/bash
+      - -c
+      - |
+        echo '=========================================='
+        echo 'StreamGraph: Initializing Neo4j Schema...'
+        echo '=========================================='
 
-      # Wait a few seconds for Neo4j to be fully ready after health check passes.
-      sleep 5
+        until cypher-shell -u neo4j -p streamgraph_research_2024 -a bolt://neo4j:7687 'RETURN 1;' >/dev/null 2>&1; do
+          echo 'Waiting for Neo4j bolt connection...'
+          sleep 2
+        done
 
-      # Create uniqueness constraint on User.id.
-      # This also implicitly creates a unique index on User.id.
-      cypher-shell -u neo4j -p streamgraph_research_2024 \
-        -a bolt://neo4j:7687 \
-        'CREATE CONSTRAINT user_id_unique IF NOT EXISTS FOR (u:User) REQUIRE u.id IS UNIQUE;'
+        # Create uniqueness constraint on User.id.
+        cypher-shell -u neo4j -p streamgraph_research_2024 \
+          -a bolt://neo4j:7687 \
+          'CREATE CONSTRAINT user_id_unique IF NOT EXISTS FOR (u:User) REQUIRE u.id IS UNIQUE;'
 
-      echo 'Created constraint: user_id_unique'
+        echo 'Created constraint: user_id_unique'
 
-      # Create uniqueness constraint on Transaction.id.
-      cypher-shell -u neo4j -p streamgraph_research_2024 \
-        -a bolt://neo4j:7687 \
-        'CREATE CONSTRAINT txn_id_unique IF NOT EXISTS FOR (t:Transaction) REQUIRE t.id IS UNIQUE;'
+        # Create uniqueness constraint on Transaction.id.
+        cypher-shell -u neo4j -p streamgraph_research_2024 \
+          -a bolt://neo4j:7687 \
+          'CREATE CONSTRAINT txn_id_unique IF NOT EXISTS FOR (t:Transaction) REQUIRE t.id IS UNIQUE;'
 
-      echo 'Created constraint: txn_id_unique'
+        echo 'Created constraint: txn_id_unique'
 
-      # Create composite index on Transaction for range queries on timestamp.
-      cypher-shell -u neo4j -p streamgraph_research_2024 \
-        -a bolt://neo4j:7687 \
-        'CREATE INDEX txn_timestamp IF NOT EXISTS FOR (t:Transaction) ON (t.timestamp);'
+        # Create composite index on Transaction for range queries on timestamp.
+        cypher-shell -u neo4j -p streamgraph_research_2024 \
+          -a bolt://neo4j:7687 \
+          'CREATE INDEX txn_timestamp IF NOT EXISTS FOR (t:Transaction) ON (t.timestamp);'
 
-      echo 'Created index: txn_timestamp'
+        echo 'Created index: txn_timestamp'
 
-      # Create index on Transaction.amount for potential range-based queries.
-      cypher-shell -u neo4j -p streamgraph_research_2024 \
-        -a bolt://neo4j:7687 \
-        'CREATE INDEX txn_amount IF NOT EXISTS FOR (t:Transaction) ON (t.amount);'
+        # Create index on Transaction.amount for potential range-based queries.
+        cypher-shell -u neo4j -p streamgraph_research_2024 \
+          -a bolt://neo4j:7687 \
+          'CREATE INDEX txn_amount IF NOT EXISTS FOR (t:Transaction) ON (t.amount);'
 
-      echo 'Created index: txn_amount'
+        echo 'Created index: txn_amount'
 
-      echo ''
-      echo '=========================================='
-      echo 'StreamGraph: Neo4j schema initialized.'
-      echo '=========================================='
+        echo ''
+        echo '=========================================='
+        echo 'StreamGraph: Neo4j schema initialized.'
+        echo '=========================================='
 
-      # Verify by listing all constraints and indexes.
-      cypher-shell -u neo4j -p streamgraph_research_2024 \
-        -a bolt://neo4j:7687 \
-        'SHOW CONSTRAINTS;'
+        # Verify by listing all constraints and indexes.
+        cypher-shell -u neo4j -p streamgraph_research_2024 \
+          -a bolt://neo4j:7687 \
+          'SHOW CONSTRAINTS;'
 
-      cypher-shell -u neo4j -p streamgraph_research_2024 \
-        -a bolt://neo4j:7687 \
-        'SHOW INDEXES;'
-      "
+        cypher-shell -u neo4j -p streamgraph_research_2024 \
+          -a bolt://neo4j:7687 \
+          'SHOW INDEXES;'
     restart: "no"

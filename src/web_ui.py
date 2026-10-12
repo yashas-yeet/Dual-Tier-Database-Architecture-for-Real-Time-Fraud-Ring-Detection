@@ -402,7 +402,7 @@ class KafkaLiveConsumerThread(threading.Thread):
         conf = {
             "bootstrap.servers": KAFKA_BOOTSTRAP_SERVERS,
             "group.id": consumer_group,
-            "auto.offset.reset": "latest",
+            "auto.offset.reset": "earliest",
             "enable.auto.commit": True,
             "session.timeout.ms": 6000,
         }
@@ -478,7 +478,7 @@ def health_check_worker():
     while True:
         # Check Kafka
         try:
-            from confluent_kafka import AdminClient
+            from confluent_kafka.admin import AdminClient
             client = AdminClient({"bootstrap.servers": KAFKA_BOOTSTRAP_SERVERS, "socket.timeout.ms": 2000})
             md = client.list_topics(timeout=2.0)
             state.kafka_healthy = bool(md.topics)
