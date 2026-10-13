@@ -176,13 +176,13 @@ REM -------------------------------------------------------------------------
 echo [5/5] Starting Real Data Producer (PaySim Stream + Fraud Rings)...
 if exist "data\paysim_dataset.csv" (
     echo    Streaming real dataset: data\paysim_dataset.csv with circular fraud rings
-    start "StreamGraph - Producer" /D "%~dp0" cmd /k ".\.venv\Scripts\python.exe src\producer.py --csv data\paysim_dataset.csv --inject-rings --tps 100"
+    start "StreamGraph - Producer" /D "%~dp0" cmd /k ".\.venv\Scripts\python.exe src\producer.py --csv data\paysim_dataset.csv --inject-rings --tps 100 --loop"
 ) else if exist "data\paysim_sample.csv" (
     echo    Streaming sample dataset: data\paysim_sample.csv with circular fraud rings
-    start "StreamGraph - Producer" /D "%~dp0" cmd /k ".\.venv\Scripts\python.exe src\producer.py --csv data\paysim_sample.csv --inject-rings --tps 100"
+    start "StreamGraph - Producer" /D "%~dp0" cmd /k ".\.venv\Scripts\python.exe src\producer.py --csv data\paysim_sample.csv --inject-rings --tps 100 --loop"
 ) else (
     echo    Streaming full synthetic benchmark dataset (50 fraud rings)
-    start "StreamGraph - Producer" /D "%~dp0" cmd /k ".\.venv\Scripts\python.exe src\producer.py --synthetic --num-transactions 100000 --tps 100"
+    start "StreamGraph - Producer" /D "%~dp0" cmd /k ".\.venv\Scripts\python.exe src\producer.py --synthetic --num-transactions 100000 --tps 100 --loop"
 )
 
 echo.

@@ -483,23 +483,8 @@ class PaySimParser:
                 f"Found: {headers}"
             )
 
-    def iterate_transactions(self):
-        """
-        Generator that yields parsed transaction dictionaries from the CSV.
-
-        Each yielded dictionary contains:
-        - All original PaySim fields (with correct types).
-        - `transaction_id`: A UUID4 string for unique identification.
-        - `producer_timestamp_ms`: Epoch milliseconds when the message was
-          created. This is injected at production time (not read time) for
-          accurate end-to-end latency measurement.
-
-        Yields:
-            Dict[str, Any]: A single parsed transaction.
-
-        Raises:
-            ValueError: If a row fails schema validation.
-        """
+    def _read_single_pass(self):
+        """Yield parsed transactions for a single pass over the CSV."""
         with open(self.csv_path, "r", encoding="utf-8") as f:
             reader = csv.DictReader(f)
 
@@ -602,6 +587,8 @@ class PaySimParser:
                         step = transaction["step"]
                         now_ms = int(time.time() * 1000)
 
+                        ring_id = f"RING-{len(ring)}H-{self._ring_counter}"
+
                         for i in range(len(ring)):
                             src = ring[i]
                             dst = ring[(i + 1) % len(ring)]
@@ -618,6 +605,7 @@ class PaySimParser:
                                 "newbalanceDest": 10000.0 + ring_amount,
                                 "isFraud": 1,
                                 "is_fraud_ring": True,
+                                "ring_id": ring_id,
                                 "ring_hop_index": i + 1,
                                 "ring_total_hops": len(ring),
                                 "producer_timestamp_ms": now_ms,
@@ -628,6 +616,36 @@ class PaySimParser:
                         f"Row {row_num}: Failed to parse — {type(e).__name__}: {e}"
                     )
                     continue
+
+    def iterate_transactions(self, loop: bool = False):
+        """
+        Generator that yields parsed transaction dictionaries from the CSV.
+
+        Each yielded dictionary contains:
+        - All original PaySim fields (with correct types).
+        - `transaction_id`: A UUID4 string for unique identification.
+        - `producer_timestamp_ms`: Epoch milliseconds when the message was
+          created. This is injected at production time (not read time) for
+          accurate end-to-end latency measurement.
+
+        Args:
+            loop: If True, continuously restarts from the beginning of the CSV
+                  for infinite live stream generation.
+
+        Yields:
+            Dict[str, Any]: A single parsed transaction.
+        """
+        iteration = 0
+        while True:
+            iteration += 1
+            if iteration > 1:
+                logger.info(
+                    f"Continuous streaming: restarting dataset '{self.csv_path.name}' "
+                    f"(cycle #{iteration})..."
+                )
+            yield from self._read_single_pass()
+            if not loop:
+                break
 
 
 # =============================================================================
@@ -832,71 +850,72 @@ class StreamGraphProducer:
         Returns:
             True if the message was enqueued successfully, False otherwise.
         """
-        try:
-            # Apply rate limiting (blocks if necessary).
-            self.rate_limiter.acquire()
+        retries = 3
+        while retries > 0:
+            try:
+                # Apply rate limiting (blocks if necessary).
+                self.rate_limiter.acquire()
 
-            # Refresh the producer timestamp to the actual produce() time
-            # for accurate latency measurement.
-            transaction["producer_timestamp_ms"] = int(time.time() * 1000)
+                # Refresh the producer timestamp to the actual produce() time
+                # for accurate latency measurement.
+                transaction["producer_timestamp_ms"] = int(time.time() * 1000)
 
-            # Serialize the transaction to JSON bytes.
-            # We use json.dumps() with ensure_ascii=False for efficiency
-            # (avoids escaping non-ASCII characters that aren't present
-            # in PaySim data anyway).
-            value_bytes = json.dumps(transaction, ensure_ascii=False).encode("utf-8")
+                # Serialize the transaction to JSON bytes.
+                value_bytes = json.dumps(transaction, ensure_ascii=False).encode("utf-8")
+                key_bytes = transaction["nameOrig"].encode("utf-8")
 
-            # Partition key: nameOrig (sender account ID).
-            # confluent-kafka hashes this key using murmur2 (by default)
-            # to determine the target partition. This ensures all transactions
-            # from the same account go to the same partition, maintaining
-            # per-account ordering — critical for the sliding window in Tier 1.
-            key_bytes = transaction["nameOrig"].encode("utf-8")
+                # Produce the message with a delivery callback.
+                # Headers include a high-resolution timestamp for latency measurement.
+                self.producer.produce(
+                    topic=self.topic,
+                    key=key_bytes,
+                    value=value_bytes,
+                    headers={
+                        "produce_time_ns": str(time.monotonic_ns()).encode("utf-8"),
+                        "transaction_id": transaction["transaction_id"].encode("utf-8"),
+                    },
+                    callback=self._delivery_callback,
+                )
 
-            # Produce the message with a delivery callback.
-            # Headers include a high-resolution timestamp for latency measurement.
-            self.producer.produce(
-                topic=self.topic,
-                key=key_bytes,
-                value=value_bytes,
-                headers={
-                    "produce_time_ns": str(time.monotonic_ns()).encode("utf-8"),
-                    "transaction_id": transaction["transaction_id"].encode("utf-8"),
-                },
-                callback=self._delivery_callback,
-            )
+                # Record the send in metrics.
+                self.metrics.record_send(
+                    is_fraud=bool(transaction["isFraud"]),
+                    txn_type=transaction["type"],
+                )
 
-            # Record the send in metrics.
-            self.metrics.record_send(
-                is_fraud=bool(transaction["isFraud"]),
-                txn_type=transaction["type"],
-            )
+                # Active callback draining: every 50 messages, give librdkafka a brief
+                # slice to drain callbacks and avoid internal queue backlog
+                if self.metrics.total_sent % 50 == 0:
+                    self.producer.poll(0.005)
+                else:
+                    self.producer.poll(0)
 
-            # Poll the producer to trigger delivery callbacks.
-            # poll(0) is non-blocking; it processes any pending callbacks
-            # without waiting. This is essential to prevent the callback
-            # queue from growing unboundedly.
-            self.producer.poll(0)
+                return True
 
-            return True
+            except BufferError:
+                retries -= 1
+                logger.warning(
+                    "Producer buffer full (backpressure detected). "
+                    "Draining pending callbacks before retrying..."
+                )
+                self.producer.poll(0.05)
+                if retries == 0:
+                    self.producer.flush(timeout=5.0)
 
-        except BufferError:
-            # The producer's internal queue is full. This indicates that
-            # the broker can't keep up with our production rate (backpressure).
-            # We flush (blocking) to drain the queue, then retry.
-            logger.warning(
-                "Producer buffer full (backpressure detected). "
-                "Flushing pending messages..."
-            )
-            self.producer.flush(timeout=10.0)
-            return False
+            except KafkaException as e:
+                logger.error(f"Kafka error during produce: {e}")
+                self.metrics.record_error()
+                return False
 
-        except KafkaException as e:
-            logger.error(f"Kafka error during produce: {e}")
-            self.metrics.record_error()
-            return False
+        return False
 
-    def run(self, csv_path: str, max_messages: int = 0, inject_rings: bool = True) -> Dict[str, Any]:
+    def run(
+        self,
+        csv_path: str,
+        max_messages: int = 0,
+        inject_rings: bool = True,
+        loop: bool = False,
+    ) -> Dict[str, Any]:
         """
         Main ingestion loop. Reads the PaySim CSV and publishes each
         transaction to Kafka.
@@ -905,6 +924,7 @@ class StreamGraphProducer:
             csv_path: Path to the PaySim CSV file.
             max_messages: Maximum number of messages to send (0 = all).
             inject_rings: Whether to interleave circular fraud ring transactions into the stream.
+            loop: Whether to loop through the CSV continuously for endless live streaming.
 
         Returns:
             Final performance metrics dictionary.
@@ -918,6 +938,7 @@ class StreamGraphProducer:
         logger.info(f"  Total rows: {parser.total_rows:,}")
         logger.info(f"  Max messages: {'all' if max_messages == 0 else f'{max_messages:,}'}")
         logger.info(f"  Target TPS: {'unlimited' if self.rate_limiter.unlimited else self.rate_limiter.target_tps:.0f}")
+        logger.info(f"  Continuous Loop: {'ACTIVE' if loop else 'DISABLED'}")
         logger.info(f"  Topic: {self.topic}")
         logger.info("=" * 70)
 
@@ -926,7 +947,7 @@ class StreamGraphProducer:
         message_count = 0
 
         try:
-            for transaction in parser.iterate_transactions():
+            for transaction in parser.iterate_transactions(loop=loop):
                 # Check for shutdown signal.
                 if self._shutdown_requested:
                     logger.info("Shutdown requested — stopping ingestion.")
@@ -1216,6 +1237,7 @@ class SyntheticPaySimGenerator:
                 sender = ring[hop]
                 recipient = ring[(hop + 1) % len(ring)]  # Circular: last → first
 
+                ring_id = f"RING-{len(ring)}H-{hop}"
                 for rep in range(transactions_per_ring):
                     idx = base_idx + hop * transactions_per_ring + rep
                     if idx < self.num_transactions:
@@ -1234,6 +1256,10 @@ class SyntheticPaySimGenerator:
                             "oldbalanceDest": self._get_balance(recipient),
                             "newbalanceDest": round(self._get_balance(recipient) + amount, 2),
                             "isFraud": 1,
+                            "is_fraud_ring": True,
+                            "ring_id": ring_id,
+                            "ring_hop_index": hop + 1,
+                            "ring_total_hops": len(ring),
                             "producer_timestamp_ms": int(time.time() * 1000),
                         }
 
@@ -1415,6 +1441,15 @@ Examples:
         help="Disable fraud ring injection into CSV stream.",
     )
 
+    # Continuous streaming
+    parser.add_argument(
+        "--loop",
+        dest="loop",
+        action="store_true",
+        default=False,
+        help="Continuously loop through the dataset for unending live streaming.",
+    )
+
     return parser.parse_args()
 
 
@@ -1471,6 +1506,7 @@ def main():
         csv_path=csv_path,
         max_messages=args.max_messages,
         inject_rings=args.inject_rings,
+        loop=args.loop,
     )
 
     # Exit with appropriate code.

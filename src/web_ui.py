@@ -98,6 +98,7 @@ class StreamState:
         self.total_suspicious = 0
         self.total_fraud_alerts = 0
         self.total_cycles_found = 0
+        self.detected_ring_ids = set()
 
         # Throughput tracking
         self.recent_tx_timestamps: Deque[float] = deque(maxlen=2000)
@@ -132,7 +133,7 @@ class StreamState:
         self.neo4j_cycle_count = 0
 
     def subscribe(self) -> queue.Queue:
-        q = queue.Queue(maxsize=150)
+        q = queue.Queue(maxsize=2000)
         with self.lock:
             self.subscribers.append(q)
         return q
@@ -145,15 +146,19 @@ class StreamState:
     def broadcast(self, event_type: str, data: Any):
         payload = f"event: {event_type}\ndata: {json.dumps(data)}\n\n"
         with self.lock:
-            dead = []
-            for q in self.subscribers:
+            for q in list(self.subscribers):
                 try:
                     q.put_nowait(payload)
                 except queue.Full:
-                    dead.append(q)
-            for q in dead:
-                if q in self.subscribers:
-                    self.subscribers.remove(q)
+                    # Lossy ring buffer: drop oldest event to keep live connection alive without disconnecting client
+                    try:
+                        q.get_nowait()
+                    except queue.Empty:
+                        pass
+                    try:
+                        q.put_nowait(payload)
+                    except queue.Full:
+                        pass
 
     def record_raw_transaction(self, txn: Dict[str, Any]):
         now = time.monotonic()
@@ -186,34 +191,63 @@ class StreamState:
             }
             self.recent_transactions.appendleft(formatted_txn)
 
-            # Update live visual graph representation
-            for u_id in [u_orig, u_dest]:
-                if u_id not in self.nodes:
-                    if len(self.nodes) >= self.max_graph_nodes:
-                        oldest = next(iter(self.nodes))
-                        del self.nodes[oldest]
-                        self.links = [l for l in self.links if l["source"] != oldest and l["target"] != oldest]
-                    self.nodes[u_id] = {
-                        "id": u_id,
-                        "label": u_id[:8],
-                        "type": "Merchant" if u_id.startswith("M") else "Customer",
-                        "is_ring": is_ring,
-                    }
-                if is_ring:
-                    self.nodes[u_id]["is_ring"] = True
+            # Update live visual graph representation: ONLY record fraud detected rings
+            if is_ring:
+                ring_id = txn.get("ring_id") or f"RING-{txn.get('ring_total_hops', 3)}H-{u_orig[:6]}"
+                for u_id in [u_orig, u_dest]:
+                    if u_id not in self.nodes:
+                        if len(self.nodes) >= self.max_graph_nodes:
+                            oldest = next(iter(self.nodes))
+                            del self.nodes[oldest]
+                            self.links = [l for l in self.links if l["source"] != oldest and l["target"] != oldest]
+                        self.nodes[u_id] = {
+                            "id": u_id,
+                            "label": u_id[:8],
+                            "type": "Merchant" if u_id.startswith("M") else "Customer",
+                            "is_ring": True,
+                            "ring_id": ring_id,
+                        }
+                    else:
+                        self.nodes[u_id]["is_ring"] = True
+                        self.nodes[u_id]["ring_id"] = ring_id
 
-            link_id = f"{u_orig}->{u_dest}_{formatted_txn['transaction_id'][:6]}"
-            self.links.append({
-                "id": link_id,
-                "source": u_orig,
-                "target": u_dest,
-                "amount": amount,
-                "type": txn.get("type", "TRANSFER"),
-                "is_ring": is_ring,
-                "tier": "Tier 1",
-            })
-            if len(self.links) > self.max_graph_links:
-                self.links = self.links[-self.max_graph_links:]
+                link_id = f"{u_orig}->{u_dest}_{formatted_txn['transaction_id'][:6]}"
+                if not any(l["id"] == link_id for l in self.links):
+                    self.links.append({
+                        "id": link_id,
+                        "source": u_orig,
+                        "target": u_dest,
+                        "amount": amount,
+                        "type": txn.get("type", "TRANSFER"),
+                        "is_ring": True,
+                        "ring_id": ring_id,
+                        "tier": "Tier 1",
+                    })
+                    if len(self.links) > self.max_graph_links:
+                        self.links = self.links[-self.max_graph_links:]
+
+                # Track completed fraud rings
+                hop_idx = txn.get("ring_hop_index", 0)
+                tot_hops = txn.get("ring_total_hops", 0)
+                if tot_hops > 0 and hop_idx == tot_hops:
+                    if ring_id not in self.detected_ring_ids:
+                        self.detected_ring_ids.add(ring_id)
+                        self.total_fraud_alerts = max(self.total_fraud_alerts, len(self.detected_ring_ids))
+                        self.total_cycles_found = max(self.total_cycles_found, len(self.detected_ring_ids))
+
+                        # Build alert event so alerts table and sound are triggered
+                        alert_item = {
+                            "alert_id": ring_id,
+                            "timestamp": datetime.now().strftime("%H:%M:%S"),
+                            "cycle_hop_count": tot_hops,
+                            "cycle_nodes": [l["source"] for l in self.links if l.get("ring_id") == ring_id] + [u_dest],
+                            "name_orig": u_orig,
+                            "amount": amount,
+                            "alert_severity": "CRITICAL" if amount > 25000 else "HIGH",
+                        }
+                        if not any(a.get("alert_id") == ring_id for a in self.recent_alerts):
+                            self.recent_alerts.appendleft(alert_item)
+                            self.broadcast("alert", alert_item)
 
         self.broadcast("transaction", formatted_txn)
 
@@ -267,20 +301,71 @@ class StreamState:
         with self.lock:
             self.total_fraud_alerts += 1
             self.total_cycles_found += 1
+
+            if "alert_id" not in alert:
+                alert["alert_id"] = f"RING-{alert.get('cycle_hop_count', 3)}H-{str(uuid.uuid4())[:6].upper()}"
+            if "timestamp" not in alert:
+                ts = alert.get("alert_timestamp")
+                if ts:
+                    try:
+                        alert["timestamp"] = datetime.fromisoformat(ts).strftime("%H:%M:%S")
+                    except Exception:
+                        alert["timestamp"] = datetime.now().strftime("%H:%M:%S")
+                else:
+                    alert["timestamp"] = datetime.now().strftime("%H:%M:%S")
+
+            raw_path = alert.get("cycle_nodes") or alert.get("cycle_user_path", [])
+            # Deduplicate closing node if repeated (e.g. [A, B, C, A])
+            if len(raw_path) > 1 and raw_path[0] == raw_path[-1]:
+                cycle_nodes = list(raw_path[:-1])
+            else:
+                cycle_nodes = list(raw_path)
+
+            alert["cycle_nodes"] = cycle_nodes
             self.recent_alerts.appendleft(alert)
 
-            # Mark ring nodes and edges in graph
-            cycle_nodes = alert.get("cycle_nodes", [])
-            for nid in cycle_nodes:
-                if nid in self.nodes:
-                    self.nodes[nid]["is_ring"] = True
+            # Add all detected fraud ring nodes and edges to live graph
+            if cycle_nodes:
+                ring_id = alert["alert_id"]
+                for nid in cycle_nodes:
+                    if nid not in self.nodes:
+                        if len(self.nodes) >= self.max_graph_nodes:
+                            oldest = next(iter(self.nodes))
+                            del self.nodes[oldest]
+                            self.links = [l for l in self.links if l["source"] != oldest and l["target"] != oldest]
+                        self.nodes[nid] = {
+                            "id": nid,
+                            "label": nid[:8],
+                            "type": "Merchant" if nid.startswith("M") else "Customer",
+                            "is_ring": True,
+                            "ring_id": ring_id,
+                        }
+                    else:
+                        self.nodes[nid]["is_ring"] = True
+                        self.nodes[nid]["ring_id"] = ring_id
 
-            for i in range(len(cycle_nodes)):
-                src = cycle_nodes[i]
-                dst = cycle_nodes[(i + 1) % len(cycle_nodes)]
-                for link in self.links:
-                    if link["source"] == src and link["target"] == dst:
-                        link["is_ring"] = True
+                n = len(cycle_nodes)
+                for i in range(n):
+                    src = cycle_nodes[i]
+                    dst = cycle_nodes[(i + 1) % n]
+                    link_id = f"{src}->{dst}_{ring_id}"
+                    existing = next((l for l in self.links if l["source"] == src and l["target"] == dst), None)
+                    if existing:
+                        existing["is_ring"] = True
+                        existing["ring_id"] = ring_id
+                    else:
+                        self.links.append({
+                            "id": link_id,
+                            "source": src,
+                            "target": dst,
+                            "amount": float(alert.get("amount", 5000.0)),
+                            "type": alert.get("type", "TRANSFER"),
+                            "is_ring": True,
+                            "ring_id": ring_id,
+                            "tier": "Tier 2",
+                        })
+                if len(self.links) > self.max_graph_links:
+                    self.links = self.links[-self.max_graph_links:]
 
         self.broadcast("alert", alert)
 
@@ -318,6 +403,10 @@ class StreamState:
                 else 96.5
             )
 
+            active_rings = len(self.detected_ring_ids) or len(set(n.get("ring_id") for n in self.nodes.values() if n.get("ring_id")))
+            effective_alerts = max(self.total_fraud_alerts, active_rings, self.neo4j_cycle_count)
+            effective_cycles = max(self.total_cycles_found, effective_alerts)
+
             return {
                 "uptime_seconds": int(uptime),
                 "mode": "live",
@@ -326,8 +415,8 @@ class StreamState:
                 "total_processed": self.total_processed,
                 "total_cleared": self.total_cleared,
                 "total_suspicious": self.total_suspicious,
-                "total_cycles_found": self.total_cycles_found,
-                "total_fraud_alerts": self.total_fraud_alerts,
+                "total_cycles_found": effective_cycles,
+                "total_fraud_alerts": effective_alerts,
                 "filter_ratio": filter_ratio,
                 "speedup_ratio": speedup,
                 "tier1_latency": {
@@ -367,6 +456,7 @@ class StreamState:
             self.total_suspicious = 0
             self.total_fraud_alerts = 0
             self.total_cycles_found = 0
+            self.detected_ring_ids.clear()
             self.start_time = time.monotonic()
             self.recent_tx_timestamps.clear()
             self.tier1_latencies.clear()
@@ -492,14 +582,21 @@ def health_check_worker():
             with driver.session() as sess:
                 u_count = sess.run("MATCH (u:User) RETURN count(u) AS c").single()["c"]
                 t_count = sess.run("MATCH (t:Transaction) RETURN count(t) AS c").single()["c"]
-                c_count = sess.run(
-                    "MATCH path = (origin:User)-[:SENT]->(:Transaction)-[:RECEIVED]->(:User)-[:SENT]->(:Transaction)-[:RECEIVED]->(origin) "
-                    "RETURN count(path) AS c"
-                ).single()["c"]
+                c_res = sess.run("""
+                    MATCH (u1:User)-[:SENT]->(:Transaction)-[:RECEIVED]->
+                          (u2:User)-[:SENT]->(:Transaction)-[:RECEIVED]->
+                          (u3:User)-[:SENT]->(:Transaction)-[:RECEIVED]->(u1)
+                    WHERE u1 <> u2 AND u1 <> u3 AND u2 <> u3
+                    RETURN count(DISTINCT u1) AS c
+                """).single()
+                c_count = c_res["c"] if c_res else 0
                 state.neo4j_healthy = True
                 state.neo4j_user_count = u_count
                 state.neo4j_txn_count = t_count
                 state.neo4j_cycle_count = c_count
+                if c_count > 0:
+                    state.total_fraud_alerts = max(state.total_fraud_alerts, c_count)
+                    state.total_cycles_found = max(state.total_cycles_found, c_count)
             driver.close()
         except Exception:
             state.neo4j_healthy = False
@@ -552,81 +649,103 @@ def get_status():
 @app.route("/api/graph")
 def get_graph():
     """
-    Returns actual nodes and relationships queried directly from the
-    live Neo4j database for the force-directed visualizer.
+    Returns detected circular fraud rings queried directly from the
+    live Neo4j database (or in-memory stream cache). ONLY fraud detected
+    rings are returned to keep the graph visualizer clean and focused.
     """
     nodes_map: Dict[str, Dict[str, Any]] = {}
     links_list: List[Dict[str, Any]] = []
 
-    # If Neo4j is available, query actual nodes and edges
+    # If Neo4j is available, query actual circular fraud rings (3-5 hops)
     if state.neo4j_healthy:
         try:
             from neo4j import GraphDatabase
             driver = GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD))
             with driver.session() as sess:
-                # 1. Fetch recent transactions & user connections
-                query = """
-                MATCH (orig:User)-[:SENT]->(t:Transaction)-[:RECEIVED]->(dest:User)
-                RETURN orig.id AS orig, dest.id AS dest, t.id AS txn_id,
-                       t.amount AS amount, t.type AS type, t.isFraud AS is_fraud
-                ORDER BY t.timestamp DESC LIMIT 70
-                """
-                res = sess.run(query)
-                for rec in res:
-                    u_orig = rec["orig"]
-                    u_dest = rec["dest"]
-                    amount = rec["amount"] or 1000.0
-                    txn_id = rec["txn_id"] or ""
+                cycle_queries = [
+                    # 3-hop circular fraud rings
+                    """
+                    MATCH (u1:User)-[:SENT]->(t1:Transaction)-[:RECEIVED]->
+                          (u2:User)-[:SENT]->(t2:Transaction)-[:RECEIVED]->
+                          (u3:User)-[:SENT]->(t3:Transaction)-[:RECEIVED]->(u1)
+                    WHERE u1 <> u2 AND u1 <> u3 AND u2 <> u3
+                    RETURN [u1.id, u2.id, u3.id] AS ring_nodes,
+                           [t1.amount, t2.amount, t3.amount] AS amounts,
+                           [t1.id, t2.id, t3.id] AS txn_ids
+                    LIMIT 10
+                    """,
+                    # 4-hop circular fraud rings
+                    """
+                    MATCH (u1:User)-[:SENT]->(t1:Transaction)-[:RECEIVED]->
+                          (u2:User)-[:SENT]->(t2:Transaction)-[:RECEIVED]->
+                          (u3:User)-[:SENT]->(t3:Transaction)-[:RECEIVED]->
+                          (u4:User)-[:SENT]->(t4:Transaction)-[:RECEIVED]->(u1)
+                    WHERE u1 <> u2 AND u1 <> u3 AND u1 <> u4 AND u2 <> u3 AND u2 <> u4 AND u3 <> u4
+                    RETURN [u1.id, u2.id, u3.id, u4.id] AS ring_nodes,
+                           [t1.amount, t2.amount, t3.amount, t4.amount] AS amounts,
+                           [t1.id, t2.id, t3.id, t4.id] AS txn_ids
+                    LIMIT 10
+                    """,
+                    # 5-hop circular fraud rings
+                    """
+                    MATCH (u1:User)-[:SENT]->(t1:Transaction)-[:RECEIVED]->
+                          (u2:User)-[:SENT]->(t2:Transaction)-[:RECEIVED]->
+                          (u3:User)-[:SENT]->(t3:Transaction)-[:RECEIVED]->
+                          (u4:User)-[:SENT]->(t4:Transaction)-[:RECEIVED]->
+                          (u5:User)-[:SENT]->(t5:Transaction)-[:RECEIVED]->(u1)
+                    WHERE u1 <> u2 AND u1 <> u3 AND u1 <> u4 AND u1 <> u5 AND u2 <> u3 AND u2 <> u4 AND u2 <> u5 AND u3 <> u4 AND u3 <> u5 AND u4 <> u5
+                    RETURN [u1.id, u2.id, u3.id, u4.id, u5.id] AS ring_nodes,
+                           [t1.amount, t2.amount, t3.amount, t4.amount, t5.amount] AS amounts,
+                           [t1.id, t2.id, t3.id, t4.id, t5.id] AS txn_ids
+                    LIMIT 10
+                    """
+                ]
+                ring_idx = 1
+                for cq in cycle_queries:
+                    c_res = sess.run(cq)
+                    for cr in c_res:
+                        ring_nodes = cr["ring_nodes"]
+                        amounts = cr.get("amounts") or [5000.0] * len(ring_nodes)
+                        txn_ids = cr.get("txn_ids") or ["" for _ in ring_nodes]
+                        ring_tag = f"RING-{len(ring_nodes)}H-{ring_idx}"
+                        ring_idx += 1
 
-                    for uid in [u_orig, u_dest]:
-                        if uid not in nodes_map:
-                            nodes_map[uid] = {
-                                "id": uid,
-                                "label": uid[:8],
-                                "type": "Merchant" if uid.startswith("M") else "Customer",
-                                "is_ring": False,
-                            }
+                        for nid in ring_nodes:
+                            if nid not in nodes_map:
+                                nodes_map[nid] = {
+                                    "id": nid,
+                                    "label": nid[:8],
+                                    "type": "Merchant" if nid.startswith("M") else "Customer",
+                                    "is_ring": True,
+                                    "ring_id": ring_tag,
+                                }
 
-                    links_list.append({
-                        "id": f"{u_orig}->{u_dest}_{txn_id[:6]}",
-                        "source": u_orig,
-                        "target": u_dest,
-                        "amount": amount,
-                        "type": rec["type"] or "TRANSFER",
-                        "is_ring": False,
-                        "tier": "Tier 2",
-                    })
-
-                # 2. Query detected circular fraud rings in Neo4j
-                cycle_query = """
-                MATCH path = (origin:User)-[:SENT]->(:Transaction)-[:RECEIVED]->
-                             (:User)-[:SENT]->(:Transaction)-[:RECEIVED]->
-                             (:User)-[:SENT]->(:Transaction)-[:RECEIVED]->(origin)
-                RETURN [node in nodes(path) WHERE 'User' in labels(node) | node.id] AS ring_nodes
-                LIMIT 15
-                """
-                c_res = sess.run(cycle_query)
-                for cr in c_res:
-                    ring_nodes = cr["ring_nodes"]
-                    for nid in ring_nodes:
-                        if nid in nodes_map:
-                            nodes_map[nid]["is_ring"] = True
-                    for i in range(len(ring_nodes)):
-                        s = ring_nodes[i]
-                        d = ring_nodes[(i + 1) % len(ring_nodes)]
-                        for l in links_list:
-                            if l["source"] == s and l["target"] == d:
-                                l["is_ring"] = True
-
+                        for i in range(len(ring_nodes)):
+                            s = ring_nodes[i]
+                            d = ring_nodes[(i + 1) % len(ring_nodes)]
+                            tx_id = txn_ids[i] if i < len(txn_ids) else ""
+                            amt = amounts[i] if i < len(amounts) else 5000.0
+                            lid = f"{s}->{d}_{tx_id[:6]}"
+                            if not any(l["source"] == s and l["target"] == d for l in links_list):
+                                links_list.append({
+                                    "id": lid,
+                                    "source": s,
+                                    "target": d,
+                                    "amount": amt,
+                                    "type": "TRANSFER",
+                                    "is_ring": True,
+                                    "ring_id": ring_tag,
+                                    "tier": "Tier 2",
+                                })
             driver.close()
         except Exception as e:
             logger.warning(f"Direct Neo4j graph fetch error: {e}")
 
-    # Fallback to in-memory live stream cache if Neo4j is empty/initializing
+    # Fallback / merge with in-memory live stream cache (strictly filtered for fraud rings)
     if not nodes_map:
         with state.lock:
-            nodes_map = dict(state.nodes)
-            links_list = list(state.links)
+            nodes_map = {k: dict(v) for k, v in state.nodes.items() if v.get("is_ring")}
+            links_list = [dict(l) for l in state.links if l.get("is_ring")]
 
     with state.lock:
         recent_alerts = list(state.recent_alerts)[:15]
@@ -635,6 +754,7 @@ def get_graph():
         "nodes": list(nodes_map.values()),
         "links": links_list,
         "recent_alerts": recent_alerts,
+        "fraud_rings_only": True,
     })
 
 
@@ -711,11 +831,11 @@ def sse_stream():
 
             while True:
                 try:
-                    msg = q.get(timeout=20.0)
+                    msg = q.get(timeout=5.0)
                     yield msg
                 except queue.Empty:
                     yield ": heartbeat\n\n"
-        except GeneratorExit:
+        finally:
             state.unsubscribe(q)
 
     return Response(

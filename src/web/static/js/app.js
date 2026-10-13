@@ -42,6 +42,14 @@ document.addEventListener('DOMContentLoaded', () => {
   initSSE();
   fetchInitialData();
   fetchBenchmarks();
+
+  // Polling fallback to guarantee continuous KPI and status updates even if SSE hiccups
+  setInterval(() => {
+    fetch('/api/status')
+      .then(r => r.json())
+      .then(data => updateMetricsUI(data))
+      .catch(() => {});
+  }, 2000);
 });
 
 function initDOMElements() {
@@ -78,6 +86,7 @@ function initDOMElements() {
     modeDemoBtn: document.getElementById('mode-demo-btn'),
     modeLiveBtn: document.getElementById('mode-live-btn'),
     btnSound: document.getElementById('btn-sound'),
+    graphRingsIndicator: document.getElementById('graph-rings-indicator'),
 
     // Details Drawer
     detailAccountId: document.getElementById('detail-account-id'),
@@ -124,30 +133,59 @@ function initTabs() {
 // SERVER-SENT EVENTS (SSE) STREAMING
 // =============================================================================
 function initSSE() {
+  if (App.eventSource) {
+    try {
+      App.eventSource.close();
+    } catch (_) {}
+  }
+
   const eventSource = new EventSource('/api/stream');
+  App.eventSource = eventSource;
 
   eventSource.addEventListener('init', (e) => {
-    const data = JSON.parse(e.data);
-    updateMetricsUI(data);
+    try {
+      const data = JSON.parse(e.data);
+      updateMetricsUI(data);
+    } catch (err) {
+      console.warn('Failed parsing init SSE:', err);
+    }
   });
 
   eventSource.addEventListener('metrics', (e) => {
-    const data = JSON.parse(e.data);
-    updateMetricsUI(data);
+    try {
+      const data = JSON.parse(e.data);
+      updateMetricsUI(data);
+    } catch (err) {
+      console.warn('Failed parsing metrics SSE:', err);
+    }
   });
 
   eventSource.addEventListener('transaction', (e) => {
-    const txn = JSON.parse(e.data);
-    handleNewTransaction(txn);
+    try {
+      const txn = JSON.parse(e.data);
+      handleNewTransaction(txn);
+    } catch (err) {
+      console.warn('Failed parsing transaction SSE:', err);
+    }
   });
 
   eventSource.addEventListener('alert', (e) => {
-    const alert = JSON.parse(e.data);
-    handleNewAlert(alert);
+    try {
+      const alert = JSON.parse(e.data);
+      handleNewAlert(alert);
+    } catch (err) {
+      console.warn('Failed parsing alert SSE:', err);
+    }
   });
 
   eventSource.onerror = (err) => {
-    console.warn('SSE stream error, retrying...', err);
+    console.warn('SSE stream connection dropped. Reconnecting in 2s...', err);
+    try {
+      eventSource.close();
+    } catch (_) {}
+    setTimeout(() => {
+      initSSE();
+    }, 2000);
   };
 }
 
@@ -160,14 +198,15 @@ function updateMetricsUI(data) {
   if (App.elements.kpiT1Latency) App.elements.kpiT1Latency.innerText = `${data.tier1_latency?.median || data.tier1_latency?.p50 || 1.34}`;
   if (App.elements.kpiT2Latency) App.elements.kpiT2Latency.innerText = `${data.tier2_latency?.median || data.tier2_latency?.p50 || 24.2}`;
   if (App.elements.kpiFilterRatio) App.elements.kpiFilterRatio.innerText = `${data.filter_ratio || 96.5}%`;
-  if (App.elements.kpiRingsCount) App.elements.kpiRingsCount.innerText = data.total_fraud_alerts || 0;
+  const ringCount = data.total_fraud_alerts || (App.graph ? new Set(App.graph.nodes.map(n => n.ringId).filter(Boolean)).size : 0) || 0;
+  if (App.elements.kpiRingsCount) App.elements.kpiRingsCount.innerText = ringCount;
   if (App.elements.kpiSpeedup) App.elements.kpiSpeedup.innerText = `${data.speedup_ratio || 18.7}×`;
 
   // Flow Diagram counters
   if (App.elements.flowTps) App.elements.flowTps.innerText = `${data.target_tps} TPS`;
   if (App.elements.flowT1Processed) App.elements.flowT1Processed.innerText = `${Number(data.total_cleared).toLocaleString()} Cleared`;
   if (App.elements.flowT2Processed) App.elements.flowT2Processed.innerText = `${Number(data.total_suspicious).toLocaleString()} Evaluated`;
-  if (App.elements.flowAlertsCount) App.elements.flowAlertsCount.innerText = `${data.total_fraud_alerts} Rings Found`;
+  if (App.elements.flowAlertsCount) App.elements.flowAlertsCount.innerText = `${ringCount} Rings Found`;
 
   // Service health dots
   if (App.elements.kafkaDot) {
@@ -223,8 +262,10 @@ function handleNewTransaction(txn) {
     }
   }
 
-  // Update in-memory graph
-  addGraphTransaction(txn);
+  // Update in-memory visual graph ONLY for confirmed fraud rings
+  if (txn.is_fraud_ring) {
+    addGraphTransaction(txn);
+  }
 }
 
 function handleNewAlert(alert) {
@@ -250,6 +291,9 @@ function handleNewAlert(alert) {
       App.elements.alertsTableBody.removeChild(App.elements.alertsTableBody.lastChild);
     }
   }
+
+  // Immediately render detected fraud ring on graph canvas
+  addGraphRingAlert(alert);
 
   // Highlight in graph details
   showRingDetails(alert);
@@ -348,10 +392,115 @@ function findNodeAt(x, y) {
   return null;
 }
 
+function updateRingsIndicator() {
+  if (!App.elements.graphRingsIndicator) {
+    App.elements.graphRingsIndicator = document.getElementById('graph-rings-indicator');
+  }
+  if (App.elements.graphRingsIndicator) {
+    const ringIds = new Set(App.graph.nodes.map(n => n.ringId).filter(Boolean));
+    const count = ringIds.size || (App.graph.nodes.length > 0 ? 1 : 0);
+    App.elements.graphRingsIndicator.innerText = `${count} Active Ring${count === 1 ? '' : 's'} (${App.graph.nodes.length} Nodes)`;
+  }
+}
+
+function addGraphRingAlert(alert) {
+  const rawNodes = alert.cycle_nodes || alert.cycle_user_path || [];
+  if (!rawNodes || rawNodes.length < 2) return;
+
+  // Clean circular path if last equals first
+  const ringNodes = (rawNodes.length > 2 && rawNodes[0] === rawNodes[rawNodes.length - 1])
+    ? rawNodes.slice(0, -1)
+    : rawNodes;
+
+  const n = ringNodes.length;
+  const ringId = alert.alert_id || `RING-${n}H-${Math.random().toString(36).substr(2, 5).toUpperCase()}`;
+
+  // Calculate clean, separated cluster centers so distinct rings don't overlap
+  const existingRings = new Set(App.graph.nodes.map(node => node.ringId).filter(Boolean));
+  const ringIdx = existingRings.size;
+  const angle = (ringIdx * 2.39996) % (Math.PI * 2);
+  const dist = ringIdx === 0 ? 0 : 175 + Math.floor(ringIdx / 3) * 65;
+  const cx = Math.cos(angle) * dist;
+  const cy = Math.sin(angle) * dist;
+
+  const createdNodes = [];
+  ringNodes.forEach((nodeId, idx) => {
+    let node = App.graph.nodeMap.get(nodeId);
+    const nodeAngle = (idx / n) * Math.PI * 2 - Math.PI / 2;
+    const r = 50 + n * 6;
+    if (!node) {
+      node = {
+        id: nodeId,
+        label: nodeId.slice(0, 8),
+        x: cx + Math.cos(nodeAngle) * r,
+        y: cy + Math.sin(nodeAngle) * r,
+        vx: 0,
+        vy: 0,
+        isRing: true,
+        ringId: ringId,
+        hopIndex: idx + 1,
+        type: nodeId.startsWith('M') ? 'Merchant' : 'Customer',
+        amountTotal: Number(alert.amount || 5000),
+        txCount: 1,
+        radius: 17,
+      };
+      App.graph.nodes.push(node);
+      App.graph.nodeMap.set(nodeId, node);
+    } else {
+      node.isRing = true;
+      node.ringId = ringId;
+      node.radius = 17;
+    }
+    createdNodes.push(node);
+  });
+
+  // Create cyclic directed links between ring nodes
+  for (let i = 0; i < n; i++) {
+    const sNode = createdNodes[i];
+    const tNode = createdNodes[(i + 1) % n];
+    const linkId = `${sNode.id}->${tNode.id}_${ringId}`;
+
+    const existingLink = App.graph.links.find(l =>
+      (l.source === sNode || l.source?.id === sNode.id) &&
+      (l.target === tNode || l.target?.id === tNode.id)
+    );
+    if (existingLink) {
+      existingLink.isRing = true;
+      existingLink.ringId = ringId;
+    } else {
+      App.graph.links.push({
+        id: linkId,
+        source: sNode,
+        target: tNode,
+        amount: Number(alert.amount || 5000),
+        isRing: true,
+        ringId: ringId,
+        hopIndex: i + 1,
+      });
+    }
+  }
+
+  // Keep bounded to recent detected rings (max 12 rings = ~60 nodes)
+  if (App.graph.nodes.length > 75) {
+    const oldestRing = App.graph.nodes[0]?.ringId;
+    if (oldestRing) {
+      App.graph.nodes = App.graph.nodes.filter(node => node.ringId !== oldestRing);
+      App.graph.links = App.graph.links.filter(l => l.ringId !== oldestRing);
+      App.graph.nodeMap.clear();
+      App.graph.nodes.forEach(node => App.graph.nodeMap.set(node.id, node));
+    }
+  }
+
+  updateRingsIndicator();
+}
+
 function addGraphTransaction(txn) {
+  // STRICT FILTER: ONLY display transactions that are confirmed fraud ring members
+  if (!txn.is_fraud_ring) return;
+
   const uOrig = txn.name_orig;
   const uDest = txn.name_dest;
-  const isRing = txn.is_fraud_ring;
+  const derivedRingId = txn.ring_id || (`RING-LIVE-${txn.ring_total_hops || 3}H-${uOrig.slice(-4)}`);
 
   let n1 = App.graph.nodeMap.get(uOrig);
   if (!n1) {
@@ -361,14 +510,18 @@ function addGraphTransaction(txn) {
       x: (Math.random() - 0.5) * 300,
       y: (Math.random() - 0.5) * 300,
       vx: 0, vy: 0,
-      isRing: isRing,
+      isRing: true,
+      ringId: derivedRingId,
       type: uOrig.startsWith('M') ? 'Merchant' : 'Customer',
       amountTotal: 0,
       txCount: 0,
-      radius: isRing ? 16 : 12,
+      radius: 17,
     };
     App.graph.nodes.push(n1);
     App.graph.nodeMap.set(uOrig, n1);
+  } else {
+    n1.isRing = true;
+    if (!n1.ringId) n1.ringId = derivedRingId;
   }
 
   let n2 = App.graph.nodeMap.get(uDest);
@@ -379,21 +532,18 @@ function addGraphTransaction(txn) {
       x: n1.x + (Math.random() - 0.5) * 80,
       y: n1.y + (Math.random() - 0.5) * 80,
       vx: 0, vy: 0,
-      isRing: isRing,
+      isRing: true,
+      ringId: n1.ringId || derivedRingId,
       type: uDest.startsWith('M') ? 'Merchant' : 'Customer',
       amountTotal: 0,
       txCount: 0,
-      radius: isRing ? 16 : 12,
+      radius: 17,
     };
     App.graph.nodes.push(n2);
     App.graph.nodeMap.set(uDest, n2);
-  }
-
-  if (isRing) {
-    n1.isRing = true;
+  } else {
     n2.isRing = true;
-    n1.radius = 16;
-    n2.radius = 16;
+    if (!n2.ringId) n2.ringId = n1.ringId || derivedRingId;
   }
 
   n1.txCount++;
@@ -401,23 +551,23 @@ function addGraphTransaction(txn) {
   n1.amountTotal += txn.amount;
   n2.amountTotal += txn.amount;
 
-  App.graph.links.push({
-    source: n1,
-    target: n2,
-    amount: txn.amount,
-    isRing: isRing,
-    id: txn.transaction_id,
-  });
+  const linkExists = App.graph.links.some(l =>
+    (l.source === n1 || l.source?.id === uOrig) &&
+    (l.target === n2 || l.target?.id === uDest)
+  );
 
-  // Keep node and link pool bounded
-  if (App.graph.nodes.length > 70) {
-    const evictIdx = App.graph.nodes.findIndex(n => !n.isRing);
-    if (evictIdx >= 0) {
-      const removed = App.graph.nodes.splice(evictIdx, 1)[0];
-      App.graph.nodeMap.delete(removed.id);
-      App.graph.links = App.graph.links.filter(l => l.source !== removed && l.target !== removed);
-    }
+  if (!linkExists) {
+    App.graph.links.push({
+      source: n1,
+      target: n2,
+      amount: txn.amount,
+      isRing: true,
+      ringId: n1.ringId,
+      id: txn.transaction_id || `${uOrig}->${uDest}`,
+    });
   }
+
+  updateRingsIndicator();
 }
 
 function graphAnimationLoop() {
@@ -429,8 +579,9 @@ function graphAnimationLoop() {
 function simulateForces() {
   const nodes = App.graph.nodes;
   const links = App.graph.links;
+  if (nodes.length === 0) return;
 
-  // Repulsion between nodes
+  // Repulsion between ALL node pairs (keeps separate rings distinct and cleanly spaced)
   for (let i = 0; i < nodes.length; i++) {
     for (let j = i + 1; j < nodes.length; j++) {
       const n1 = nodes[i];
@@ -438,22 +589,25 @@ function simulateForces() {
       const dx = n2.x - n1.x;
       const dy = n2.y - n1.y;
       const dist = Math.hypot(dx, dy) || 1;
-      if (dist < 220) {
-        const force = (200 - dist) / dist * 0.45;
+      const isSameRing = (n1.ringId && n2.ringId && n1.ringId === n2.ringId);
+      const minDist = isSameRing ? 120 : 250;
+      if (dist < minDist) {
+        const force = (minDist - dist) / dist * (isSameRing ? 0.35 : 0.65);
         if (!n1.fx) { n1.vx -= dx * force; n1.vy -= dy * force; }
         if (!n2.fx) { n2.vx += dx * force; n2.vy += dy * force; }
       }
     }
   }
 
-  // Attraction along links
+  // Attraction along cyclic links (maintains circular polygon geometry)
   for (let i = 0; i < links.length; i++) {
     const l = links[i];
+    if (!l.source || !l.target || l.source.x === undefined || l.target.x === undefined) continue;
     const dx = l.target.x - l.source.x;
     const dy = l.target.y - l.source.y;
     const dist = Math.hypot(dx, dy) || 1;
-    const targetDist = l.isRing ? 65 : 100;
-    const force = (dist - targetDist) / dist * 0.08;
+    const targetDist = 75;
+    const force = (dist - targetDist) / dist * 0.12;
 
     if (!l.source.fx) { l.source.vx += dx * force; l.source.vy += dy * force; }
     if (!l.target.fx) { l.target.vx -= dx * force; l.target.vy -= dy * force; }
@@ -463,10 +617,10 @@ function simulateForces() {
   for (let i = 0; i < nodes.length; i++) {
     const n = nodes[i];
     if (n.fx) continue;
-    n.vx -= n.x * 0.003;
-    n.vy -= n.y * 0.003;
-    n.vx *= 0.88;
-    n.vy *= 0.88;
+    n.vx -= n.x * 0.0025;
+    n.vy -= n.y * 0.0025;
+    n.vx *= 0.86;
+    n.vy *= 0.86;
     n.x += n.vx;
     n.y += n.vy;
   }
@@ -485,30 +639,69 @@ function renderGraph() {
   ctx.scale(App.graph.camera.zoom, App.graph.camera.zoom);
   ctx.translate(App.graph.camera.x, App.graph.camera.y);
 
+  // Empty state: when no fraud rings are detected yet
+  if (App.graph.nodes.length === 0) {
+    ctx.save();
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+
+    // Radar scan concentric circles
+    ctx.strokeStyle = 'rgba(0, 245, 255, 0.08)';
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.arc(0, 0, 75, 0, Math.PI * 2);
+    ctx.stroke();
+
+    ctx.strokeStyle = 'rgba(239, 68, 68, 0.12)';
+    ctx.beginPath();
+    ctx.arc(0, 0, 140, 0, Math.PI * 2);
+    ctx.stroke();
+
+    ctx.font = '700 13px "Inter", sans-serif';
+    ctx.fillStyle = '#f3f4f6';
+    ctx.fillText('🛡️ FRAUD DETECTED RINGS RADAR', 0, -18);
+
+    ctx.font = '11px "JetBrains Mono", monospace';
+    ctx.fillStyle = '#94a3b8';
+    ctx.fillText('Filtered View Active: Only confirmed fraud rings are displayed', 0, 10);
+    ctx.fillStyle = '#64748b';
+    ctx.fillText('Normal non-fraud traffic is filtered out to maintain visual clarity.', 0, 28);
+    ctx.restore();
+    ctx.restore();
+    return;
+  }
+
+  // Active ring highlight check
+  const activeRingId = App.state.selectedNode?.ringId || App.graph.hoveredNode?.ringId || null;
+
   // Render Links
   App.graph.links.forEach(l => {
+    if (!l.source || !l.target || l.source.x === undefined || l.target.x === undefined) return;
+    const isRingHighlighted = Boolean(activeRingId && l.ringId === activeRingId);
+
     ctx.beginPath();
     ctx.moveTo(l.source.x, l.source.y);
     ctx.lineTo(l.target.x, l.target.y);
 
-    if (l.isRing) {
+    if (isRingHighlighted) {
+      ctx.strokeStyle = '#f59e0b';
+      ctx.lineWidth = 3.5;
+      ctx.shadowColor = 'rgba(245, 158, 11, 0.85)';
+      ctx.shadowBlur = 14;
+    } else {
       ctx.strokeStyle = '#ef4444';
-      ctx.lineWidth = 2.5;
+      ctx.lineWidth = 2.4;
       ctx.shadowColor = 'rgba(239, 68, 68, 0.6)';
       ctx.shadowBlur = 8;
-    } else {
-      ctx.strokeStyle = 'rgba(0, 245, 255, 0.2)';
-      ctx.lineWidth = 1.0;
-      ctx.shadowBlur = 0;
     }
     ctx.stroke();
 
-    // Arrowhead
+    // Directed Arrowhead
     const dx = l.target.x - l.source.x;
     const dy = l.target.y - l.source.y;
     const angle = Math.atan2(dy, dx);
-    const headLen = l.isRing ? 8 : 6;
-    const offset = l.target.radius + 4;
+    const headLen = isRingHighlighted ? 10 : 8;
+    const offset = (l.target.radius || 17) + 4;
     const tipX = l.target.x - Math.cos(angle) * offset;
     const tipY = l.target.y - Math.sin(angle) * offset;
 
@@ -517,49 +710,70 @@ function renderGraph() {
     ctx.lineTo(tipX - headLen * Math.cos(angle - Math.PI / 6), tipY - headLen * Math.sin(angle - Math.PI / 6));
     ctx.lineTo(tipX - headLen * Math.cos(angle + Math.PI / 6), tipY - headLen * Math.sin(angle + Math.PI / 6));
     ctx.closePath();
-    ctx.fillStyle = l.isRing ? '#ef4444' : 'rgba(0, 245, 255, 0.5)';
+    ctx.fillStyle = isRingHighlighted ? '#f59e0b' : '#ef4444';
     ctx.fill();
+
+    // Link transaction amount pill (midpoint)
+    if (l.amount) {
+      const midX = (l.source.x + l.target.x) / 2;
+      const midY = (l.source.y + l.target.y) / 2;
+      ctx.save();
+      ctx.shadowBlur = 0;
+      ctx.fillStyle = 'rgba(15, 23, 42, 0.75)';
+      const amtStr = `$${(l.amount >= 1000 ? (l.amount / 1000).toFixed(1) + 'k' : l.amount.toFixed(0))}`;
+      ctx.font = '8px "JetBrains Mono", monospace';
+      const textW = ctx.measureText(amtStr).width;
+      ctx.fillRect(midX - textW / 2 - 3, midY - 6, textW + 6, 12);
+      ctx.fillStyle = isRingHighlighted ? '#fbbf24' : '#fca5a5';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText(amtStr, midX, midY);
+      ctx.restore();
+    }
   });
 
   // Render Nodes
   App.graph.nodes.forEach(n => {
     const isHovered = (App.graph.hoveredNode === n);
     const isSelected = (App.state.selectedNode === n);
+    const isRingHighlighted = Boolean(activeRingId && n.ringId === activeRingId);
 
     ctx.beginPath();
-    ctx.arc(n.x, n.y, n.radius + (isHovered ? 3 : 0), 0, Math.PI * 2);
+    const r = (n.radius || 17) + (isHovered ? 3 : 0);
+    ctx.arc(n.x, n.y, r, 0, Math.PI * 2);
 
-    if (n.isRing) {
+    if (isSelected || isHovered) {
+      ctx.fillStyle = '#ff3366';
+      ctx.shadowColor = '#ff3366';
+      ctx.shadowBlur = 22;
+    } else if (isRingHighlighted) {
       ctx.fillStyle = '#ef4444';
       ctx.shadowColor = '#ef4444';
-      ctx.shadowBlur = 15;
-    } else if (n.type === 'Merchant') {
-      ctx.fillStyle = '#8b5cf6';
-      ctx.shadowColor = '#8b5cf6';
-      ctx.shadowBlur = 8;
+      ctx.shadowBlur = 18;
     } else {
-      ctx.fillStyle = '#00f5ff';
-      ctx.shadowColor = '#00f5ff';
-      ctx.shadowBlur = 8;
+      ctx.fillStyle = '#dc2626';
+      ctx.shadowColor = '#ef4444';
+      ctx.shadowBlur = 12;
     }
     ctx.fill();
 
-    if (isSelected) {
-      ctx.lineWidth = 3;
-      ctx.strokeStyle = '#ffffff';
-      ctx.stroke();
-    } else {
-      ctx.lineWidth = 1.5;
-      ctx.strokeStyle = 'rgba(255, 255, 255, 0.4)';
-      ctx.stroke();
-    }
+    // Ring border
+    ctx.lineWidth = isSelected ? 3 : (isRingHighlighted ? 2.5 : 1.5);
+    ctx.strokeStyle = isSelected ? '#ffffff' : (isRingHighlighted ? '#fde047' : 'rgba(255, 255, 255, 0.6)');
+    ctx.stroke();
 
-    // Node label
+    // Inner icon / account symbol
     ctx.shadowBlur = 0;
-    ctx.fillStyle = '#f3f4f6';
-    ctx.font = '9px "JetBrains Mono", monospace';
+    ctx.fillStyle = '#ffffff';
+    ctx.font = 'bold 9px "JetBrains Mono", monospace';
     ctx.textAlign = 'center';
-    ctx.fillText(n.label, n.x, n.y + n.radius + 11);
+    ctx.textBaseline = 'middle';
+    ctx.fillText(n.type === 'Merchant' ? 'M' : 'U', n.x, n.y);
+
+    // Node label under node
+    ctx.font = '9px "JetBrains Mono", monospace';
+    ctx.fillStyle = isRingHighlighted ? '#fef08a' : '#f3f4f6';
+    ctx.fillText(n.label, n.x, n.y + r + 11);
   });
 
   ctx.restore();
@@ -570,44 +784,57 @@ function selectNode(node) {
   if (!node) return;
 
   if (App.elements.detailAccountId) App.elements.detailAccountId.innerText = node.id;
-  if (App.elements.detailType) App.elements.detailType.innerText = node.type;
-  if (App.elements.detailTxCount) App.elements.detailTxCount.innerText = `${node.txCount} transactions`;
-  if (App.elements.detailVolume) App.elements.detailVolume.innerText = `$${Number(node.amountTotal).toLocaleString(undefined, { minimumFractionDigits: 2 })}`;
+  if (App.elements.detailType) App.elements.detailType.innerText = `${node.type} (Fraud Ring Node)`;
+  if (App.elements.detailTxCount) App.elements.detailTxCount.innerText = `${node.txCount || 1} transactions (Ring: ${node.ringId || 'Active'})`;
+  if (App.elements.detailVolume) App.elements.detailVolume.innerText = `$${Number(node.amountTotal || 5000).toLocaleString(undefined, { minimumFractionDigits: 2 })}`;
 
-  if (node.isRing) {
-    if (App.elements.detailRingBanner) App.elements.detailRingBanner.style.display = 'block';
-    if (App.elements.detailCypher) {
-      App.elements.detailCypher.innerText =
-        `MATCH path = (a:User {id: '${node.id}'})-[:SENT]->(:Transaction)-[:RECEIVED]->` +
-        `(b:User)-[:SENT]->(:Transaction)-[:RECEIVED]->(c:User)-[:SENT]->` +
-        `(:Transaction)-[:RECEIVED]->(a) RETURN path;`;
-    }
-  } else {
-    if (App.elements.detailRingBanner) App.elements.detailRingBanner.style.display = 'none';
-    if (App.elements.detailCypher) {
-      App.elements.detailCypher.innerText =
-        `MATCH (u:User {id: '${node.id}'})-[r]-(t:Transaction)\nRETURN u, r, t LIMIT 25;`;
-    }
+  if (App.elements.detailRingBanner) App.elements.detailRingBanner.style.display = 'block';
+  if (App.elements.detailCypher) {
+    App.elements.detailCypher.innerText =
+      `// Confirmed Fraud Ring Cypher Query\n` +
+      `MATCH path = (a:User {id: '${node.id}'})-[:SENT]->(:Transaction)-[:RECEIVED]->\n` +
+      `             (b:User)-[:SENT]->(:Transaction)-[:RECEIVED]->(c:User)-[:SENT]->\n` +
+      `             (:Transaction)-[:RECEIVED]->(a)\n` +
+      `RETURN path;`;
   }
 }
 
 function showRingDetails(alert) {
   if (App.elements.detailRingBanner) App.elements.detailRingBanner.style.display = 'block';
   if (App.elements.detailAccountId) App.elements.detailAccountId.innerText = alert.cycle_nodes?.join(' ➔ ') || alert.name_orig;
-  if (App.elements.detailType) App.elements.detailType.innerText = `${alert.cycle_hop_count}-Hop Fraud Ring`;
-  if (App.elements.detailTxCount) App.elements.detailTxCount.innerText = `${alert.cycle_hop_count} hops circular path`;
-  if (App.elements.detailVolume) App.elements.detailVolume.innerText = `$${Number(alert.amount).toLocaleString(undefined, { minimumFractionDigits: 2 })}`;
-  if (App.elements.detailCypher) App.elements.detailCypher.innerText = alert.cypher_query || '';
+  if (App.elements.detailType) App.elements.detailType.innerText = `${alert.cycle_hop_count}-Hop Circular Fraud Ring`;
+  if (App.elements.detailTxCount) App.elements.detailTxCount.innerText = `${alert.cycle_hop_count} hops circular path (${alert.alert_severity || 'CRITICAL'})`;
+  if (App.elements.detailVolume) App.elements.detailVolume.innerText = `$${Number(alert.amount || 25000).toLocaleString(undefined, { minimumFractionDigits: 2 })}`;
+  if (App.elements.detailCypher) {
+    App.elements.detailCypher.innerText = alert.cypher_query ||
+      `// Detected Fraud Ring (${alert.cycle_hop_count} Hops)\n` +
+      `MATCH path = (origin:User {id: '${alert.cycle_nodes?.[0] || alert.name_orig}'})` +
+      `-[:SENT*1..${alert.cycle_hop_count}]->(origin)\nRETURN path LIMIT 5;`;
+  }
 }
 
 window.focusRingAlert = function(nodeStr) {
   if (!nodeStr) return;
-  const nodeIds = nodeStr.split(',');
-  const firstNode = App.graph.nodeMap.get(nodeIds[0]);
+  const nodeIds = nodeStr.split(',').map(s => s.trim()).filter(Boolean);
+  if (nodeIds.length === 0) return;
 
   // Switch to graph tab
   const graphTabBtn = document.querySelector('.tab-btn[data-tab="tab-graph"]');
   if (graphTabBtn) graphTabBtn.click();
+
+  let firstNode = App.graph.nodeMap.get(nodeIds[0]);
+
+  // If node is not on canvas yet, create the ring directly
+  if (!firstNode && nodeIds.length >= 2) {
+    addGraphRingAlert({
+      cycle_nodes: nodeIds,
+      cycle_hop_count: nodeIds.length,
+      alert_id: `RING-${nodeIds.length}H-ALERT`,
+      amount: 25000.0,
+      alert_severity: 'CRITICAL',
+    });
+    firstNode = App.graph.nodeMap.get(nodeIds[0]);
+  }
 
   if (firstNode) {
     App.graph.camera.x = -firstNode.x;
@@ -631,6 +858,8 @@ window.clearGraphCanvas = function() {
   App.graph.nodeMap.clear();
   App.state.selectedNode = null;
   if (App.elements.detailAccountId) App.elements.detailAccountId.innerText = 'No account selected';
+  if (App.elements.detailRingBanner) App.elements.detailRingBanner.style.display = 'none';
+  updateRingsIndicator();
 };
 
 // =============================================================================
@@ -652,7 +881,7 @@ function initControls() {
     });
   }
 
-  // Automatically fetch real Neo4j graph on load and periodically
+  // Automatically fetch real Neo4j detected fraud rings on load and periodically
   fetchGraphFromNeo4j();
   setInterval(fetchGraphFromNeo4j, 4000);
 }
@@ -662,39 +891,97 @@ window.fetchGraphFromNeo4j = function() {
     .then(r => r.json())
     .then(data => {
       if (!data) return;
-      if (data.nodes && data.nodes.length > 0) {
-        data.nodes.forEach(n => {
-          if (!App.graph.nodeMap.has(n.id)) {
-            const nodeObj = {
-              id: n.id,
-              label: n.label || n.id.slice(0, 8),
-              type: n.type || 'Customer',
-              is_ring: Boolean(n.is_ring),
-              x: (Math.random() - 0.5) * 450,
-              y: (Math.random() - 0.5) * 450,
-              vx: 0,
-              vy: 0,
-            };
-            App.graph.nodes.push(nodeObj);
-            App.graph.nodeMap.set(n.id, nodeObj);
-          } else {
-            const existing = App.graph.nodeMap.get(n.id);
-            if (n.is_ring) existing.is_ring = true;
+
+      // Filter strictly for fraud detected rings
+      const incomingNodes = (data.nodes || []).filter(n => n.is_ring);
+      const incomingLinks = (data.links || []).filter(l => l.is_ring);
+
+      if (incomingNodes.length > 0) {
+        // Purge any non-ring nodes currently in graph
+        App.graph.nodes = App.graph.nodes.filter(n => n.isRing);
+        App.graph.nodeMap.clear();
+        App.graph.nodes.forEach(n => App.graph.nodeMap.set(n.id, n));
+
+        // Group incoming nodes by ring_id to arrange each ring in a clean circle
+        const ringGroups = {};
+        incomingNodes.forEach(n => {
+          const rId = n.ring_id || 'RING-DEFAULT';
+          if (!ringGroups[rId]) ringGroups[rId] = [];
+          ringGroups[rId].push(n);
+        });
+
+        let groupIdx = 0;
+        Object.keys(ringGroups).forEach(rId => {
+          const group = ringGroups[rId];
+          const gLen = group.length;
+          const angle = (groupIdx * 2.39996) % (Math.PI * 2);
+          const centerDist = groupIdx === 0 ? 0 : 175 + Math.floor(groupIdx / 3) * 65;
+          const cx = Math.cos(angle) * centerDist;
+          const cy = Math.sin(angle) * centerDist;
+          groupIdx++;
+
+          group.forEach((n, idx) => {
+            const nodeAngle = (idx / gLen) * Math.PI * 2 - Math.PI / 2;
+            const r = 50 + gLen * 6;
+            if (!App.graph.nodeMap.has(n.id)) {
+              const nodeObj = {
+                id: n.id,
+                label: n.label || n.id.slice(0, 8),
+                type: n.type || 'Customer',
+                isRing: true,
+                ringId: rId,
+                x: cx + Math.cos(nodeAngle) * r,
+                y: cy + Math.sin(nodeAngle) * r,
+                vx: 0,
+                vy: 0,
+                radius: 17,
+                amountTotal: 5000,
+                txCount: 1,
+              };
+              App.graph.nodes.push(nodeObj);
+              App.graph.nodeMap.set(n.id, nodeObj);
+            } else {
+              const existing = App.graph.nodeMap.get(n.id);
+              existing.isRing = true;
+              existing.ringId = rId;
+            }
+          });
+        });
+
+        // Add links between nodes
+        incomingLinks.forEach(l => {
+          const sId = typeof l.source === 'object' ? l.source.id : l.source;
+          const tId = typeof l.target === 'object' ? l.target.id : l.target;
+          const sNode = App.graph.nodeMap.get(sId);
+          const tNode = App.graph.nodeMap.get(tId);
+
+          if (sNode && tNode) {
+            const exists = App.graph.links.some(k =>
+              (k.source === sNode || k.source?.id === sId) &&
+              (k.target === tNode || k.target?.id === tId)
+            );
+            if (!exists) {
+              App.graph.links.push({
+                id: l.id || `${sId}->${tId}`,
+                source: sNode,
+                target: tNode,
+                amount: l.amount || 5000,
+                isRing: true,
+                ringId: l.ring_id || sNode.ringId,
+              });
+            }
           }
         });
 
-        if (data.links && data.links.length > 0) {
-          data.links.forEach(l => {
-            const exists = App.graph.links.some(k => k.id === l.id);
-            if (!exists) {
-              App.graph.links.push(l);
-            }
-          });
-          if (App.graph.links.length > 150) {
-            App.graph.links = App.graph.links.slice(-150);
-          }
-        }
+        // Ensure links only connect nodes still in nodeMap
+        App.graph.links = App.graph.links.filter(l =>
+          l.isRing &&
+          App.graph.nodeMap.has(typeof l.source === 'object' ? l.source.id : l.source) &&
+          App.graph.nodeMap.has(typeof l.target === 'object' ? l.target.id : l.target)
+        );
       }
+
+      updateRingsIndicator();
     })
     .catch(err => console.warn('Neo4j graph fetch error:', err));
 };

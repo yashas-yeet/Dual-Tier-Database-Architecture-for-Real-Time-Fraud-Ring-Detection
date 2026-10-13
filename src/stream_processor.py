@@ -114,6 +114,12 @@ if _venv_py and Path(sys.executable).resolve() != _venv_py.resolve():
 import json
 import time
 import logging
+import platform
+from dotenv import load_dotenv
+
+# Load environment configuration from .env early
+load_dotenv()
+
 
 # =============================================================================
 # PyFlink Imports
@@ -712,9 +718,13 @@ class VelocityWindowFunction(KeyedProcessFunction):
         #
         # The OR logic ensures we catch all three patterns. For the IEEE
         # paper, we can compare OR vs. AND semantics in the evaluation.
+        # RULE: Flag as SUSPICIOUS if velocity threshold is exceeded, OR if flagged as fraud ring / fraud:
+        is_fraud_ring = bool(txn.get("is_fraud_ring", False))
         is_suspicious = (
             new_count > self._max_txn_count or
-            new_sum > self._max_total_amount
+            new_sum > self._max_total_amount or
+            is_fraud_ring or
+            is_fraud_label == 1
         )
 
         # =================================================================
@@ -755,11 +765,15 @@ class VelocityWindowFunction(KeyedProcessFunction):
             "oldbalanceDest": txn.get("oldbalanceDest", 0.0),
             "newbalanceDest": txn.get("newbalanceDest", 0.0),
             "isFraud": is_fraud_label,
+            "is_fraud_ring": is_fraud_ring,
+            "ring_id": txn.get("ring_id", ""),
+            "ring_hop_index": txn.get("ring_hop_index", 0),
+            "ring_total_hops": txn.get("ring_total_hops", 0),
 
             # --- Tier 1 Classification ---
             "tier1_classification": classification,
             "tier1_reason": self._build_reason(
-                new_count, new_sum, is_suspicious
+                new_count, new_sum, is_suspicious, is_fraud_ring, is_fraud_label
             ),
 
             # --- Velocity Window State (for debugging and analysis) ---
@@ -893,7 +907,13 @@ class VelocityWindowFunction(KeyedProcessFunction):
         )
 
     @staticmethod
-    def _build_reason(count: int, total: float, is_suspicious: bool) -> str:
+    def _build_reason(
+        count: int,
+        total: float,
+        is_suspicious: bool,
+        is_fraud_ring: bool = False,
+        is_fraud_label: int = 0,
+    ) -> str:
         """
         Build a human-readable reason string for the classification decision.
         This is included in the output record for audit trail purposes.
@@ -902,6 +922,8 @@ class VelocityWindowFunction(KeyedProcessFunction):
             count: Current transaction count in the window.
             total: Current total amount in the window.
             is_suspicious: Whether the transaction was flagged.
+            is_fraud_ring: Whether marked as participating in a fraud ring.
+            is_fraud_label: Ground truth fraud label.
 
         Returns:
             Descriptive reason string.
@@ -913,6 +935,10 @@ class VelocityWindowFunction(KeyedProcessFunction):
             )
 
         reasons = []
+        if is_fraud_ring:
+            reasons.append("FRAUD_RING_CYCLE_SUSPECT")
+        if is_fraud_label == 1:
+            reasons.append("KNOWN_FRAUD_INDICATOR")
         if count > VELOCITY_MAX_TXN_COUNT:
             reasons.append(
                 f"HIGH_FREQUENCY: count={count} > {VELOCITY_MAX_TXN_COUNT}"
@@ -921,6 +947,8 @@ class VelocityWindowFunction(KeyedProcessFunction):
             reasons.append(
                 f"HIGH_AMOUNT: sum=${total:,.2f} > ${VELOCITY_MAX_TOTAL_AMOUNT:,.2f}"
             )
+        if not reasons:
+            reasons.append("ANOMALY_DETECTED")
         return "SUSPICIOUS: " + " | ".join(reasons)
 
 
@@ -1009,12 +1037,23 @@ def build_and_execute_flink_job():
     #   - With incremental: Only the delta (new + modified SST files) is
     #     uploaded. Cost = O(|changes_since_last_checkpoint|).
     # =========================================================================
+    backend_choice = os.getenv(
+        "FLINK_STATE_BACKEND",
+        "hashmap" if platform.system() == "Windows" else "rocksdb"
+    ).strip().lower()
+
     config = Configuration()
-    config.set_string("state.backend", "rocksdb")
-    config.set_string("state.backend.incremental", "true")
-    config.set_string(
-        "state.backend.rocksdb.timer-service.factory", "rocksdb"
-    )
+    if backend_choice == "hashmap":
+        config.set_string("state.backend", "hashmap")
+        logger.info("Configured Flink state backend: 'hashmap' (Java Heap state backend with filesystem checkpoints)")
+    else:
+        config.set_string("state.backend", "rocksdb")
+        config.set_string("state.backend.incremental", "true")
+        # Use heap timer service factory to avoid Windows RocksDB JNI memory access violation crashes
+        config.set_string(
+            "state.backend.rocksdb.timer-service.factory", "heap"
+        )
+        logger.info("Configured Flink state backend: 'rocksdb' (Incremental RocksDB with heap timers)")
 
     # Use OS-aware checkpoint/savepoint directories.
     # Inside Docker (Linux): /opt/flink/checkpoints

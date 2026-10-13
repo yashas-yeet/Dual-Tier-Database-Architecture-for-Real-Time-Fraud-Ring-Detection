@@ -102,6 +102,17 @@ class TestPaySimParser(unittest.TestCase):
             self.assertIsInstance(txn["amount"], float)
             self.assertIsInstance(txn["step"], int)
 
+    def test_parser_looping(self):
+        if not self.sample_csv.exists():
+            self.skipTest("Sample CSV not found")
+        parser = PaySimParser(str(self.sample_csv))
+        looped_count = 0
+        for txn in parser.iterate_transactions(loop=True):
+            looped_count += 1
+            if looped_count >= 15:
+                break
+        self.assertEqual(looped_count, 15)
+
 
 class TestSyntheticPaySimGenerator(unittest.TestCase):
     """Test SyntheticPaySimGenerator properties."""

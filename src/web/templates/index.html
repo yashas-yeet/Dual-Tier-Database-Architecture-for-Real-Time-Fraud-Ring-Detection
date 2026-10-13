@@ -279,10 +279,12 @@
         <div class="graph-canvas-card">
           <!-- Canvas Overlay Tools -->
           <div class="graph-overlay-tools">
+            <span class="badge ring" style="display: inline-flex; align-items: center; gap: 0.35rem; padding: 0.35rem 0.75rem; font-weight: 700; letter-spacing: 0.03em; font-size: 0.72rem;">🛡️ FRAUD DETECTED RINGS ONLY</span>
             <button class="overlay-btn" onclick="zoomGraph(1.2)">🔍 Zoom In</button>
             <button class="overlay-btn" onclick="zoomGraph(0.8)">🔍 Zoom Out</button>
             <button class="overlay-btn" onclick="resetGraphCamera()">🎯 Center View</button>
             <button class="overlay-btn" onclick="clearGraphCanvas()">🧹 Clear Canvas</button>
+            <button class="overlay-btn" onclick="fetchGraphFromNeo4j()">🔄 Refresh Rings</button>
           </div>
 
           <!-- Canvas Element -->
@@ -291,16 +293,15 @@
           <!-- Graph Legend -->
           <div class="graph-legend">
             <div class="legend-item">
-              <span class="legend-color" style="background: var(--primary); box-shadow: 0 0 6px var(--primary);"></span>
-              <span>Customer Account</span>
-            </div>
-            <div class="legend-item">
-              <span class="legend-color" style="background: var(--secondary); box-shadow: 0 0 6px var(--secondary);"></span>
-              <span>Merchant Account</span>
-            </div>
-            <div class="legend-item">
               <span class="legend-color" style="background: var(--accent-red); box-shadow: 0 0 8px var(--accent-red);"></span>
-              <span>Fraud Ring Cycle (3-5 Hops)</span>
+              <span>Fraud Ring Account (Cycle Node)</span>
+            </div>
+            <div class="legend-item">
+              <span class="legend-color" style="background: #f59e0b; box-shadow: 0 0 8px #f59e0b;"></span>
+              <span>Circular Money Flow (Hop Link)</span>
+            </div>
+            <div class="legend-item">
+              <span id="graph-rings-indicator" class="badge ring" style="font-size: 0.68rem; padding: 2px 7px;">0 Active Rings</span>
             </div>
           </div>
         </div>
